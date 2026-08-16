@@ -214,7 +214,41 @@ tasks.register('dumpArtifacts') {
     if not input_jars:
         raise RuntimeError("No Android bytecode artifacts were collected for D8")
 
-    run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_dir, *input_jars)
+    # Some AndroidX/Kotlin-multiplatform libraries publish both an umbrella
+    # module and a JVM-target module under different Maven coordinates (e.g.
+    # androidx.collection:collection vs collection-jvm, compose.runtime:runtime
+    # vs runtime-android, lifecycle-runtime-ktx vs lifecycle-runtime-ktx-android).
+    # Both can legally resolve for different transitive paths and both contain
+    # the same compiled classes, which D8 rejects as duplicate class
+    # definitions even though the *files* aren't byte-identical (so the
+    # sha256 file-level dedup above doesn't catch them). Build de-duplicated
+    # copies for the D8 invocation only, dropping any .class entry already
+    # seen in an earlier jar (sorted by artifact id) -- the untouched
+    # per-artifact jars in classes_dir still ship in compose-libs.zip.
+    d8_dir = bundle_root / "d8-input"
+    d8_dir.mkdir(parents=True, exist_ok=True)
+    seen_class_names = {}
+    class_duplicates = []
+    d8_input_jars = []
+    for classes_jar in input_jars:
+        d8_jar = d8_dir / classes_jar.name
+        kept_any = False
+        with zipfile.ZipFile(classes_jar) as src_zf, zipfile.ZipFile(d8_jar, "w", zipfile.ZIP_DEFLATED) as dst_zf:
+            for info in src_zf.infolist():
+                if info.filename.endswith(".class"):
+                    if info.filename in seen_class_names:
+                        class_duplicates.append({"class": info.filename, "droppedFrom": classes_jar.name, "keptIn": seen_class_names[info.filename]})
+                        continue
+                    seen_class_names[info.filename] = classes_jar.name
+                dst_zf.writestr(info, src_zf.read(info.filename))
+                kept_any = True
+        if kept_any:
+            d8_input_jars.append(d8_jar)
+
+    if not d8_input_jars:
+        raise RuntimeError("No Android bytecode remained for D8 after class-level dedup")
+
+    run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_dir, *d8_input_jars)
     dex_files = sorted(dex_dir.glob("classes*.dex"), key=lambda p: (p.name != "classes.dex", p.name))
     if not dex_files:
         raise RuntimeError("D8 produced no dex files")
@@ -230,7 +264,7 @@ tasks.register('dumpArtifacts') {
 
     manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "uniqueD8InputCount": len(input_jars), "duplicateD8InputCount": len(duplicate_inputs), "duplicates": duplicate_inputs, "versionConflictCount": len(version_conflicts), "versionConflicts": version_conflicts, "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
+    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "uniqueD8InputCount": len(input_jars), "duplicateD8InputCount": len(duplicate_inputs), "duplicates": duplicate_inputs, "versionConflictCount": len(version_conflicts), "versionConflicts": version_conflicts, "classDuplicateCount": len(class_duplicates), "classDuplicates": class_duplicates, "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
     (OUT / "resolution-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     archive = OUT / "compose-libs.zip"
@@ -242,7 +276,7 @@ tasks.register('dumpArtifacts') {
                 zf.write(path, path.relative_to(bundle_root))
 
     print(f"Wrote {archive}")
-    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | unique D8 inputs: {len(input_jars)} | duplicates removed: {len(duplicate_inputs)} | version conflicts aligned: {len(version_conflicts)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
+    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | unique D8 inputs: {len(input_jars)} | duplicate jars removed: {len(duplicate_inputs)} | version conflicts aligned: {len(version_conflicts)} | duplicate classes dropped: {len(class_duplicates)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
 
 
 if __name__ == "__main__":
