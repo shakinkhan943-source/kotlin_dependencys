@@ -2,10 +2,10 @@
 """
 Resolves the essential Jetpack Compose Maven artifacts, dexes each one
 SEPARATELY (never merged), and packages them into:
-
-  output/compose-libs.zip        - classes/<artifact-id>.jar + dex/<artifact-id>.dex per artifact
-  output/compose-libraries.json  - manifest describing features + artifacts
-
+ 
+   output/compose-libs.zip        - classes/<artifact-id>.jar + dex/<artifact-id>.dex per artifact
+   output/compose-libraries.json  - manifest describing features + artifacts
+ 
 This repo has no dependencyResolutionManagement restrictions, so the
 generated Gradle script is free to declare its own repositories{} block
 (unlike sketchware-pro's monorepo, which uses FAIL_ON_PROJECT_REPOS).
@@ -118,6 +118,7 @@ repositories {{
     google()
     mavenCentral()
     maven {{ url "https://maven.pkg.jetbrains.space/public/p/compose/dev" }}
+    maven {{ url "https://androidx.dev/storage/compose-mirrors/repository/" }}
 }}
 {chr(10).join(dependency_lines)}
 
