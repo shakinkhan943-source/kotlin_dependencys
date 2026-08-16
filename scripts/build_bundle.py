@@ -19,52 +19,13 @@ LIFECYCLE_COMPOSE = os.environ.get("LIFECYCLE_COMPOSE_VERSION", "2.8.7")
 ANDROID_PLATFORM = os.environ.get("ANDROID_COMPILE_SDK", "android-36")
 
 FEATURES = {
-    "core": {
-        "name": "Compose Core",
-        "description": "Required Compose runtime, UI and foundation APIs.",
-        "required": True, "tag": "IMPORTANT",
-        "roots": [
-            f"androidx.compose.runtime:runtime:{COMPOSE_UI}",
-            f"androidx.compose.ui:ui:{COMPOSE_UI}",
-            f"androidx.compose.foundation:foundation:{COMPOSE_UI}",
-        ],
-    },
-    "material3": {
-        "name": "Material 3",
-        "description": "Material 3 components and theming for Compose.",
-        "required": True, "tag": "IMPORTANT",
-        "roots": [f"androidx.compose.material3:material3:{COMPOSE_MATERIAL3}"],
-    },
-    "activity-compose": {
-        "name": "Activity Compose",
-        "description": "Integrates Compose content with Android activities.",
-        "required": True, "tag": "IMPORTANT",
-        "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"],
-    },
-    "animation": {
-        "name": "Compose Animation",
-        "description": "Animation APIs beyond the core foundation set.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.compose.animation:animation:{COMPOSE_UI}"],
-    },
-    "material-icons": {
-        "name": "Material Icons Extended",
-        "description": "The full Material icon set for Compose.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.compose.material:material-icons-extended:{COMPOSE_UI}"],
-    },
-    "navigation-compose": {
-        "name": "Navigation Compose",
-        "description": "Navigate between composables with a NavHost/NavController.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"],
-    },
-    "lifecycle-compose": {
-        "name": "Lifecycle ViewModel Compose",
-        "description": "ViewModel + lifecycle-aware state collection for Compose.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"],
-    },
+    "core": {"name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.runtime:runtime:{COMPOSE_UI}", f"androidx.compose.ui:ui:{COMPOSE_UI}", f"androidx.compose.foundation:foundation:{COMPOSE_UI}"]},
+    "material3": {"name": "Material 3", "description": "Material 3 components and theming for Compose.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.material3:material3:{COMPOSE_MATERIAL3}"]},
+    "activity-compose": {"name": "Activity Compose", "description": "Integrates Compose content with Android activities.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"]},
+    "animation": {"name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.animation:animation:{COMPOSE_UI}"]},
+    "material-icons": {"name": "Material Icons Extended", "description": "The full Material icon set for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.material:material-icons-extended:{COMPOSE_UI}"]},
+    "navigation-compose": {"name": "Navigation Compose", "description": "Navigate between composables with a NavHost/NavController.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"]},
+    "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
 
@@ -74,8 +35,7 @@ def run(*args):
 
 
 def main():
-    if WORK.exists():
-        shutil.rmtree(WORK)
+    if WORK.exists(): shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -84,19 +44,15 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-
-        # These are standalone Gradle configurations, so Gradle has no
-        # Android consumer attributes to use for Compose's multiplatform
-        # publications. Explicitly model an Android runtime consumer.
-        # In particular, ui=android removes Desktop/iOS/etc.; usage=java-runtime
-        # then selects androidRuntimeElements instead of androidApiElements.
+        # Resolve Android runtime artifacts. Do NOT force LibraryElements=jar:
+        # AndroidX publishes runtime artifacts as AARs, and requiring jar would
+        # reject activity-compose and other Android libraries before resolution.
         dependency_lines.append(
             f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
             f"{config_name}.attributes {{\n"
             f"    attribute(org.gradle.api.attributes.Attribute.of('ui', String), 'android')\n"
             f"    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))\n"
             f"    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))\n"
-            f"    attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, org.gradle.api.attributes.LibraryElements.JAR))\n"
             f"}}"
         )
         for coord in feature["roots"]:
@@ -107,7 +63,6 @@ def main():
         f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}"
         for fid, cname in configurations
     ]
-
     groovy = f"""
 repositories {{
     google()
@@ -125,7 +80,6 @@ tasks.register('dumpArtifacts') {{
     }}
 }}
 """
-
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
     (WORK / "settings.gradle").write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
@@ -137,16 +91,13 @@ tasks.register('dumpArtifacts') {{
     if not android_jar.exists():
         sdk = Path(os.environ.get("ANDROID_SDK_ROOT", os.environ.get("ANDROID_HOME", "")))
         android_jar = sdk / "platforms" / ANDROID_PLATFORM / "android.jar"
-    if not android_jar.exists():
-        raise RuntimeError(f"android.jar not found: {android_jar}")
+    if not android_jar.exists(): raise RuntimeError(f"android.jar not found: {android_jar}")
 
     bundle_root = WORK / "bundle"
     (bundle_root / "classes").mkdir(parents=True)
     (bundle_root / "dex").mkdir(parents=True)
 
-    artifact_by_file = {}
-    file_meta = {}
-    feature_files = {}
+    artifact_by_file, file_meta, feature_files = {}, {}, {}
     for fid, entries in resolved.items():
         feature_files[fid] = []
         for entry in entries:
@@ -160,8 +111,7 @@ tasks.register('dumpArtifacts') {{
     d8 = shutil.which("d8")
     if not d8:
         candidates = sorted(Path(os.environ["ANDROID_SDK_ROOT"]).glob("build-tools/*/d8"))
-        if not candidates:
-            raise RuntimeError("d8 executable not found")
+        if not candidates: raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
 
     for file, aid in artifact_by_file.items():
@@ -169,18 +119,12 @@ tasks.register('dumpArtifacts') {{
         classes_jar = bundle_root / "classes" / f"{aid}.jar"
         if src.suffix == ".aar":
             with zipfile.ZipFile(src) as zf:
-                if "classes.jar" in zf.namelist():
-                    classes_jar.write_bytes(zf.read("classes.jar"))
-        else:
-            shutil.copy2(src, classes_jar)
-
+                if "classes.jar" in zf.namelist(): classes_jar.write_bytes(zf.read("classes.jar"))
+        else: shutil.copy2(src, classes_jar)
         if not classes_jar.exists() or classes_jar.stat().st_size == 0:
-            (bundle_root / "dex" / f"{aid}.dex").touch()
-            continue
-
+            (bundle_root / "dex" / f"{aid}.dex").touch(); continue
         dex_tmp = WORK / "dex-tmp"
-        if dex_tmp.exists():
-            shutil.rmtree(dex_tmp)
+        if dex_tmp.exists(): shutil.rmtree(dex_tmp)
         dex_tmp.mkdir()
         run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_tmp, classes_jar)
         shutil.move(dex_tmp / "classes.dex", bundle_root / "dex" / f"{aid}.dex")
@@ -190,28 +134,16 @@ tasks.register('dumpArtifacts') {{
         module = file_meta[file]
         group, name, version = module.split(":", 2)
         artifacts.append({"id": aid, "coordinate": module, "packageName": group, "dependencies": []})
+    for fid, feature in FEATURES.items(): feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid])]
 
-    for fid, feature in FEATURES.items():
-        feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid])]
-
-    manifest = {
-        "schemaVersion": 1,
-        "composeVersion": COMPOSE_UI,
-        "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()],
-        "artifacts": artifacts,
-    }
+    manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
     archive = OUT / "compose-libs.zip"
-    if archive.exists():
-        archive.unlink()
+    if archive.exists(): archive.unlink()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in bundle_root.rglob("*"):
-            if path.is_file():
-                zf.write(path, path.relative_to(bundle_root))
-
+            if path.is_file(): zf.write(path, path.relative_to(bundle_root))
     print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
