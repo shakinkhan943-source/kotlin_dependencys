@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Build an Android-only Jetpack Compose dependency bundle.
 
-The resolver uses the concrete Android-published Compose coordinates and
-configures the Gradle consumer as an Android/JVM runtime consumer. This lets
-Gradle select release runtime variants instead of treating API/runtime/source
-variants as ambiguous. Ordinary AndroidX/JVM dependencies continue to use
-normal Gradle resolution. A final name filter is only a safety net.
+Compose roots use concrete Android-published artifacts. Gradle resolves their
+normal Android/JVM transitive graph; the consumer deliberately does not force
+Kotlin's androidJvm platform attribute because many valid AndroidX/JVM
+libraries publish ordinary JVM/runtime variants.
 """
 import json
 import os
@@ -26,51 +25,16 @@ LIFECYCLE_COMPOSE = os.environ.get("LIFECYCLE_COMPOSE_VERSION", "2.8.7")
 ANDROID_PLATFORM = os.environ.get("ANDROID_COMPILE_SDK", "android-36")
 
 FEATURES = {
-    "core": {
-        "name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.",
-        "required": True, "tag": "IMPORTANT",
-        "roots": [
-            f"androidx.compose.runtime:runtime-android:{COMPOSE_UI}",
-            f"androidx.compose.ui:ui-android:{COMPOSE_UI}",
-            f"androidx.compose.foundation:foundation-android:{COMPOSE_UI}",
-        ],
-    },
-    "material3": {
-        "name": "Material 3", "description": "Material 3 components and theming for Compose.",
-        "required": True, "tag": "IMPORTANT",
-        "roots": [f"androidx.compose.material3:material3-android:{COMPOSE_MATERIAL3}"],
-    },
-    "activity-compose": {
-        "name": "Activity Compose", "description": "Integrates Compose content with Android activities.",
-        "required": True, "tag": "IMPORTANT",
-        "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"],
-    },
-    "animation": {
-        "name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.compose.animation:animation-android:{COMPOSE_UI}"],
-    },
-    "material-icons": {
-        "name": "Material Icons Extended", "description": "The full Material icon set for Compose.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.compose.material:material-icons-extended-android:{COMPOSE_UI}"],
-    },
-    "navigation-compose": {
-        "name": "Navigation Compose", "description": "Navigate between composables with a NavHost/NavController.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"],
-    },
-    "lifecycle-compose": {
-        "name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.",
-        "required": False, "tag": "OPTIONAL",
-        "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"],
-    },
+    "core": {"name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.runtime:runtime-android:{COMPOSE_UI}", f"androidx.compose.ui:ui-android:{COMPOSE_UI}", f"androidx.compose.foundation:foundation-android:{COMPOSE_UI}"]},
+    "material3": {"name": "Material 3", "description": "Material 3 components and theming for Compose.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.material3:material3-android:{COMPOSE_MATERIAL3}"]},
+    "activity-compose": {"name": "Activity Compose", "description": "Integrates Compose content with Android activities.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"]},
+    "animation": {"name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.animation:animation-android:{COMPOSE_UI}"]},
+    "material-icons": {"name": "Material Icons Extended", "description": "The full Material icon set for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.material:material-icons-extended-android:{COMPOSE_UI}"]},
+    "navigation-compose": {"name": "Navigation Compose", "description": "Navigate between composables with a NavHost/NavController.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"]},
+    "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
-UNSUPPORTED_SUFFIXES = (
-    "-desktop", "-windows", "-linux", "-macos", "-macosx", "-ios",
-    "-tvos", "-watchos", "-wasm", "-js", "-mingw", "-swing", "-awt",
-)
+UNSUPPORTED_SUFFIXES = ("-desktop", "-windows", "-linux", "-macos", "-macosx", "-ios", "-tvos", "-watchos", "-wasm", "-js", "-mingw", "-swing", "-awt")
 UNSUPPORTED_GROUPS = {"org.jetbrains.compose.desktop"}
 
 
@@ -105,18 +69,13 @@ def main():
             f"configurations.getByName('{cname}').attributes {{",
             "    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))",
             "    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))",
-            "    attribute(org.gradle.api.attributes.Attribute.of('org.jetbrains.kotlin.platform.type', String), 'androidJvm')",
             "}",
         ]
         for coord in feature["roots"]:
             dependency_lines.append(f"dependencies.add('{cname}', '{coord}')")
 
     resolved_json = WORK / "resolved.json"
-    collect_lines = [
-        f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}"
-        for fid, cname in configurations
-    ]
-
+    collect_lines = [f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}" for fid, cname in configurations]
     groovy = """plugins { id 'base' }
 
 repositories {
@@ -138,7 +97,6 @@ tasks.register('dumpArtifacts') {
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
     (WORK / "settings.gradle").write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
-
     run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
@@ -151,11 +109,6 @@ tasks.register('dumpArtifacts') {
             else:
                 rejected.append({"feature": fid, "coordinate": entry["module"]})
         resolved[fid] = kept
-
-    if rejected:
-        print(f"Rejected {len(rejected)} unsupported platform artifacts:")
-        for item in rejected:
-            print("  -", item["feature"], item["coordinate"])
 
     sdk = Path(os.environ.get("ANDROID_SDK_ROOT", os.environ.get("ANDROID_HOME", "")))
     android_jar = Path(os.environ.get("ANDROID_JAR", "")) if os.environ.get("ANDROID_JAR") else sdk / "platforms" / ANDROID_PLATFORM / "android.jar"
@@ -221,24 +174,9 @@ tasks.register('dumpArtifacts') {
     for fid, feature in FEATURES.items():
         feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid]) if f in artifact_by_file]
 
-    manifest = {
-        "schemaVersion": 1,
-        "composeVersion": COMPOSE_UI,
-        "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()],
-        "artifacts": artifacts,
-    }
+    manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-    report = {
-        "androidOnly": True,
-        "resolutionStrategy": "explicit-android-artifacts",
-        "composeVersion": COMPOSE_UI,
-        "material3Version": COMPOSE_MATERIAL3,
-        "artifactCount": len(artifacts),
-        "rejectedArtifactCount": len(rejected),
-        "rejectedArtifacts": rejected,
-        "d8InputBytes": total_input_bytes,
-    }
+    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes}
     (OUT / "resolution-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     archive = OUT / "compose-libs.zip"
