@@ -28,6 +28,36 @@ FEATURES = {
     "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
+# These are platforms/toolkits that must never enter an Android-only bundle.
+# In particular, do NOT exclude every artifact containing "jvm": the current
+# Sketchware/Android compiler can legitimately need JVM stub artifacts.
+UNSUPPORTED_ARTIFACT_SUFFIXES = (
+    "-desktop",
+    "-windows",
+    "-linux",
+    "-macos",
+    "-macosx",
+    "-ios",
+    "-tvos",
+    "-watchos",
+    "-wasm",
+    "-js",
+    "-mingw",
+    "-swing",
+    "-awt",
+)
+UNSUPPORTED_GROUPS = {
+    "org.jetbrains.compose.desktop",
+}
+
+
+def is_android_artifact(module: str) -> bool:
+    """Return whether a resolved Maven coordinate belongs in the Android bundle."""
+    group, name, _version = module.split(":", 2)
+    if group in UNSUPPORTED_GROUPS:
+        return False
+    return not name.lower().endswith(UNSUPPORTED_ARTIFACT_SUFFIXES)
+
 
 def run(*args):
     print("+", " ".join(str(a) for a in args), flush=True)
@@ -45,14 +75,27 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        # Android runtime consumer. We intentionally do not force jar/aar:
-        # AndroidX runtime components can be AARs while JVM dependencies are JARs.
+        # Ask Gradle for an Android/JVM consumer variant. The old custom `ui`
+        # attribute is retained for compatibility, but by itself it is not a
+        # standard Compose/Gradle platform attribute and therefore cannot stop
+        # Desktop variants from entering the graph.
         dependency_lines.append(
             f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
             f"{config_name}.attributes {{\n"
             f"    attribute(org.gradle.api.attributes.Attribute.of('ui', String), 'android')\n"
+            f"    attribute(org.gradle.api.attributes.Attribute.of('org.jetbrains.kotlin.platform.type', String), 'androidJvm')\n"
             f"    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))\n"
             f"    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))\n"
+            f"}}\n"
+            f"{config_name}.resolutionStrategy.componentSelection {{\n"
+            f"    all {{ selection ->\n"
+            f"        def n = selection.candidate.module.toLowerCase()\n"
+            f"        def blocked = ['-desktop', '-windows', '-linux', '-macos', '-macosx', '-ios', '-tvos', '-watchos', '-wasm', '-js', '-mingw', '-swing', '-awt'].any {{ n.endsWith(it) }}\n"
+            f"        def g = selection.candidate.group.toLowerCase()\n"
+            f"        if (blocked || g == 'org.jetbrains.compose.desktop') {{\n"
+            f"            selection.reject('Android-only Compose bundle: unsupported platform artifact')\n"
+            f"        }}\n"
+            f"    }}\n"
             f"}}"
         )
         for coord in feature["roots"]:
@@ -87,6 +130,24 @@ tasks.register('dumpArtifacts') {{
     run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
+    # Belt-and-suspenders safety check: even if a repository publishes a
+    # malformed variant or a future Gradle change bypasses component selection,
+    # an unsupported platform artifact can never be copied into the bundle.
+    rejected = []
+    for fid, entries in resolved.items():
+        kept = []
+        for entry in entries:
+            if is_android_artifact(entry["module"]):
+                kept.append(entry)
+            else:
+                rejected.append({"feature": fid, "coordinate": entry["module"]})
+        resolved[fid] = kept
+
+    if rejected:
+        print(f"Rejected {len(rejected)} unsupported platform artifacts after resolution:")
+        for item in rejected:
+            print(f"  - {item['feature']}: {item['coordinate']}")
+
     # Do not use Path("") here: it becomes '.' and makes the existence check
     # succeed, which previously caused D8 to receive the project directory as
     # its --lib instead of the actual Android platform jar.
@@ -120,6 +181,7 @@ tasks.register('dumpArtifacts') {{
             raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
 
+    total_input_bytes = 0
     for file, aid in artifact_by_file.items():
         src = Path(file)
         classes_jar = bundle_root / "classes" / f"{aid}.jar"
@@ -135,6 +197,7 @@ tasks.register('dumpArtifacts') {{
             # They contain no bytecode and therefore have nothing to D8.
             continue
 
+        total_input_bytes += classes_jar.stat().st_size
         dex_tmp = WORK / "dex-tmp"
         if dex_tmp.exists():
             shutil.rmtree(dex_tmp)
@@ -166,6 +229,17 @@ tasks.register('dumpArtifacts') {{
     }
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
+    report = {
+        "androidOnly": True,
+        "composeVersion": COMPOSE_UI,
+        "material3Version": COMPOSE_MATERIAL3,
+        "artifactCount": len(artifacts),
+        "rejectedArtifactCount": len(rejected),
+        "rejectedArtifacts": rejected,
+        "d8InputBytes": total_input_bytes,
+    }
+    (OUT / "resolution-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
     archive = OUT / "compose-libs.zip"
     if archive.exists():
         archive.unlink()
@@ -174,6 +248,7 @@ tasks.register('dumpArtifacts') {{
             if path.is_file():
                 zf.write(path, path.relative_to(bundle_root))
     print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
+    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB")
 
 
 if __name__ == "__main__":
