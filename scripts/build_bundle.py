@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Jetpack Compose dependency bundle."""
+"""Build the Jetpack Compose Android dependency bundle."""
 import json
 import os
 import shutil
@@ -35,7 +35,8 @@ def run(*args):
 
 
 def main():
-    if WORK.exists(): shutil.rmtree(WORK)
+    if WORK.exists():
+        shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -44,9 +45,8 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        # Resolve Android runtime artifacts. Do NOT force LibraryElements=jar:
-        # AndroidX publishes runtime artifacts as AARs, and requiring jar would
-        # reject activity-compose and other Android libraries before resolution.
+        # Android runtime consumer. We intentionally do not force jar/aar:
+        # AndroidX runtime components can be AARs while JVM dependencies are JARs.
         dependency_lines.append(
             f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
             f"{config_name}.attributes {{\n"
@@ -87,11 +87,16 @@ tasks.register('dumpArtifacts') {{
     run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
-    android_jar = Path(os.environ.get("ANDROID_JAR", ""))
-    if not android_jar.exists():
+    # Do not use Path("") here: it becomes '.' and makes the existence check
+    # succeed, which previously caused D8 to receive the project directory as
+    # its --lib instead of the actual Android platform jar.
+    android_jar_env = os.environ.get("ANDROID_JAR")
+    android_jar = Path(android_jar_env) if android_jar_env else Path()
+    if not android_jar_env or not android_jar.is_file():
         sdk = Path(os.environ.get("ANDROID_SDK_ROOT", os.environ.get("ANDROID_HOME", "")))
         android_jar = sdk / "platforms" / ANDROID_PLATFORM / "android.jar"
-    if not android_jar.exists(): raise RuntimeError(f"android.jar not found: {android_jar}")
+    if not android_jar.is_file():
+        raise RuntimeError(f"android.jar not found: {android_jar}")
 
     bundle_root = WORK / "bundle"
     (bundle_root / "classes").mkdir(parents=True)
@@ -111,7 +116,8 @@ tasks.register('dumpArtifacts') {{
     d8 = shutil.which("d8")
     if not d8:
         candidates = sorted(Path(os.environ["ANDROID_SDK_ROOT"]).glob("build-tools/*/d8"))
-        if not candidates: raise RuntimeError("d8 executable not found")
+        if not candidates:
+            raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
 
     for file, aid in artifact_by_file.items():
@@ -119,31 +125,56 @@ tasks.register('dumpArtifacts') {{
         classes_jar = bundle_root / "classes" / f"{aid}.jar"
         if src.suffix == ".aar":
             with zipfile.ZipFile(src) as zf:
-                if "classes.jar" in zf.namelist(): classes_jar.write_bytes(zf.read("classes.jar"))
-        else: shutil.copy2(src, classes_jar)
+                if "classes.jar" in zf.namelist():
+                    classes_jar.write_bytes(zf.read("classes.jar"))
+        else:
+            shutil.copy2(src, classes_jar)
+
         if not classes_jar.exists() or classes_jar.stat().st_size == 0:
-            (bundle_root / "dex" / f"{aid}.dex").touch(); continue
+            # Some published artifacts are metadata/empty JVM stub artifacts.
+            # They contain no bytecode and therefore have nothing to D8.
+            continue
+
         dex_tmp = WORK / "dex-tmp"
-        if dex_tmp.exists(): shutil.rmtree(dex_tmp)
+        if dex_tmp.exists():
+            shutil.rmtree(dex_tmp)
         dex_tmp.mkdir()
         run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_tmp, classes_jar)
-        shutil.move(dex_tmp / "classes.dex", bundle_root / "dex" / f"{aid}.dex")
+
+        dex_files = sorted(dex_tmp.glob("classes*.dex"))
+        if not dex_files:
+            # D8 can legitimately produce no dex for an empty/metadata-only jar.
+            # Do not make the whole bundle fail merely because classes.dex is absent.
+            continue
+        if len(dex_files) > 1:
+            raise RuntimeError(f"D8 produced multiple dex files for {src.name}: {dex_files}")
+        shutil.move(dex_files[0], bundle_root / "dex" / f"{aid}.dex")
 
     artifacts = []
     for file, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
         module = file_meta[file]
         group, name, version = module.split(":", 2)
         artifacts.append({"id": aid, "coordinate": module, "packageName": group, "dependencies": []})
-    for fid, feature in FEATURES.items(): feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid])]
+    for fid, feature in FEATURES.items():
+        feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid])]
 
-    manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
+    manifest = {
+        "schemaVersion": 1,
+        "composeVersion": COMPOSE_UI,
+        "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()],
+        "artifacts": artifacts,
+    }
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
     archive = OUT / "compose-libs.zip"
-    if archive.exists(): archive.unlink()
+    if archive.exists():
+        archive.unlink()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in bundle_root.rglob("*"):
-            if path.is_file(): zf.write(path, path.relative_to(bundle_root))
+            if path.is_file():
+                zf.write(path, path.relative_to(bundle_root))
     print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
