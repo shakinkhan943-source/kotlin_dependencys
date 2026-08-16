@@ -101,7 +101,17 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        dependency_lines.append(f"configurations.maybeCreate('{config_name}')")
+        # These are standalone resolvable configurations rather than normal
+        # Android configurations, so Gradle otherwise cannot infer which
+        # Compose UI variant the consumer wants. Explicitly request the
+        # Android UI variant to avoid ambiguity between Android and AWT
+        # Skiko variants (for example skiko:0.7.7).
+        dependency_lines.append(
+            f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
+            f"{config_name}.attributes {{\n"
+            f"    attribute(org.gradle.api.attributes.Attribute.of('ui', String), 'android')\n"
+            f"}}"
+        )
         for coord in feature["roots"]:
             dependency_lines.append(f"dependencies.add('{config_name}', '{coord}')")
 
