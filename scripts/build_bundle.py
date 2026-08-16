@@ -117,6 +117,7 @@ def main():
 repositories {{
     google()
     mavenCentral()
+    maven {{ url "https://maven.pkg.jetbrains.space/public/p/compose/dev" }}
 }}
 {chr(10).join(dependency_lines)}
 
