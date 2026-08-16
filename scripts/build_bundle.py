@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build an Android-only Jetpack Compose dependency bundle.
 
-The important rule is simple: resolve Android-published Compose artifacts
-from Google Maven, not the generic multiplatform coordinates. Transitive
-AndroidX dependencies are then resolved normally by Gradle. A final name
-filter is only a safety net; it is not used to repair a bad dependency graph.
+The resolver uses the concrete Android-published Compose coordinates and
+configures the Gradle consumer as an Android/JVM runtime consumer. This lets
+Gradle select release runtime variants instead of treating API/runtime/source
+variants as ambiguous. Ordinary AndroidX/JVM dependencies continue to use
+normal Gradle resolution. A final name filter is only a safety net.
 """
 import json
 import os
@@ -24,9 +25,6 @@ NAVIGATION_COMPOSE = os.environ.get("NAVIGATION_COMPOSE_VERSION", "2.8.5")
 LIFECYCLE_COMPOSE = os.environ.get("LIFECYCLE_COMPOSE_VERSION", "2.8.7")
 ANDROID_PLATFORM = os.environ.get("ANDROID_COMPILE_SDK", "android-36")
 
-# These are deliberately the Android-published coordinates. The generic
-# Compose coordinates can expose multiplatform/Desktop variants in Gradle's
-# metadata; the -android modules are the concrete Android artifacts we need.
 FEATURES = {
     "core": {
         "name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.",
@@ -104,6 +102,11 @@ def main():
             f"configurations.maybeCreate('{cname}')",
             f"configurations.getByName('{cname}').canBeResolved = true",
             f"configurations.getByName('{cname}').canBeConsumed = false",
+            f"configurations.getByName('{cname}').attributes {{",
+            "    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))",
+            "    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))",
+            "    attribute(org.gradle.api.attributes.Attribute.of('org.jetbrains.kotlin.platform.type', String), 'androidJvm')",
+            "}",
         ]
         for coord in feature["roots"]:
             dependency_lines.append(f"dependencies.add('{cname}', '{coord}')")
