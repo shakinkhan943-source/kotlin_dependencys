@@ -2,9 +2,9 @@
 """Build an Android-only Jetpack Compose dependency bundle.
 
 Compose roots use concrete Android-published artifacts. Gradle resolves their
-normal Android/JVM transitive graph; the consumer deliberately does not force
-Kotlin's androidJvm platform attribute because many valid AndroidX/JVM
-libraries publish ordinary JVM/runtime variants.
+normal Android/JVM transitive graph. All resolved bytecode is then supplied to
+one D8 invocation so cross-library references are resolved together and the
+bundle can contain classes.dex, classes2.dex, etc. as required.
 """
 import json
 import os
@@ -141,29 +141,36 @@ tasks.register('dumpArtifacts') {
             raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
 
+    # Convert every AAR/JAR to a plain classes JAR first. D8 must receive the
+    # complete classpath in one invocation so references between libraries are
+    # resolved together. It may emit multiple dex files; that is expected.
+    input_jars = []
     total_input_bytes = 0
-    for source, aid in artifact_by_file.items():
+    for source, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
         src = Path(source)
         classes_jar = classes_dir / f"{aid}.jar"
-        if src.suffix == ".aar":
+        if src.suffix.lower() == ".aar":
             with zipfile.ZipFile(src) as zf:
                 if "classes.jar" not in zf.namelist():
                     continue
                 classes_jar.write_bytes(zf.read("classes.jar"))
-        else:
+        elif src.suffix.lower() == ".jar":
             shutil.copy2(src, classes_jar)
+        else:
+            continue
         if not classes_jar.exists() or classes_jar.stat().st_size == 0:
             continue
+        input_jars.append(classes_jar)
         total_input_bytes += classes_jar.stat().st_size
-        tmp = WORK / "dex-tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        tmp.mkdir()
-        run(d8, "--min-api", "23", "--lib", android_jar, "--output", tmp, classes_jar)
-        dex_files = sorted(tmp.glob("classes*.dex"))
-        if len(dex_files) != 1:
-            raise RuntimeError(f"Expected one dex from {src.name}, got {len(dex_files)}")
-        shutil.move(dex_files[0], dex_dir / f"{aid}.dex")
+
+    if not input_jars:
+        raise RuntimeError("No Android bytecode artifacts were collected for D8")
+
+    # One D8 invocation for the complete dependency graph.
+    run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_dir, *input_jars)
+    dex_files = sorted(dex_dir.glob("classes*.dex"), key=lambda p: (p.name != "classes.dex", p.name))
+    if not dex_files:
+        raise RuntimeError("D8 produced no dex files")
 
     artifacts = []
     for source, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
@@ -176,7 +183,7 @@ tasks.register('dumpArtifacts') {
 
     manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes}
+    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
     (OUT / "resolution-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     archive = OUT / "compose-libs.zip"
@@ -188,7 +195,7 @@ tasks.register('dumpArtifacts') {
                 zf.write(path, path.relative_to(bundle_root))
 
     print(f"Wrote {archive}")
-    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB")
+    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
 
 
 if __name__ == "__main__":
