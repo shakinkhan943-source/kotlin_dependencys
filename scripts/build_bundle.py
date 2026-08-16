@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Build the Jetpack Compose Android dependency bundle."""
+"""Build the Jetpack Compose Android dependency bundle.
+
+The resolver intentionally lets Gradle perform normal variant-aware dependency
+resolution. Android-only filtering is applied after resolution as a safety net;
+we do not add a custom `ui=android` attribute because most AndroidX/JVM
+libraries do not publish that attribute and it can make valid dependencies
+unresolvable.
+"""
 import json
 import os
 import shutil
@@ -28,33 +35,19 @@ FEATURES = {
     "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
-# These are platforms/toolkits that must never enter an Android-only bundle.
-# In particular, do NOT exclude every artifact containing "jvm": the current
-# Sketchware/Android compiler can legitimately need JVM stub artifacts.
+# These are platform/toolkit artifacts that must never enter an Android-only
+# bundle. Do NOT reject every artifact containing "jvm" or "jvmstubs": some
+# JVM bytecode/stubs can legitimately be required by the Android compiler.
 UNSUPPORTED_ARTIFACT_SUFFIXES = (
-    "-desktop",
-    "-windows",
-    "-linux",
-    "-macos",
-    "-macosx",
-    "-ios",
-    "-tvos",
-    "-watchos",
-    "-wasm",
-    "-js",
-    "-mingw",
-    "-swing",
-    "-awt",
+    "-desktop", "-windows", "-linux", "-macos", "-macosx", "-ios",
+    "-tvos", "-watchos", "-wasm", "-js", "-mingw", "-swing", "-awt",
 )
-UNSUPPORTED_GROUPS = {
-    "org.jetbrains.compose.desktop",
-}
+UNSUPPORTED_GROUPS = {"org.jetbrains.compose.desktop"}
 
 
 def is_android_artifact(module: str) -> bool:
-    """Return whether a resolved Maven coordinate belongs in the Android bundle."""
     group, name, _version = module.split(":", 2)
-    if group in UNSUPPORTED_GROUPS:
+    if group.lower() in UNSUPPORTED_GROUPS:
         return False
     return not name.lower().endswith(UNSUPPORTED_ARTIFACT_SUFFIXES)
 
@@ -75,28 +68,14 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        # Ask Gradle for an Android/JVM consumer variant. The old custom `ui`
-        # attribute is retained for compatibility, but by itself it is not a
-        # standard Compose/Gradle platform attribute and therefore cannot stop
-        # Desktop variants from entering the graph.
+        # IMPORTANT: no custom `ui=android` or Kotlin platform attribute here.
+        # Normal Gradle variant matching is allowed to resolve AndroidX and
+        # Kotlin dependencies. Unsupported Compose platform artifacts are
+        # removed after resolution by the Python safety filter below.
         dependency_lines.append(
             f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
-            f"{config_name}.attributes {{\n"
-            f"    attribute(org.gradle.api.attributes.Attribute.of('ui', String), 'android')\n"
-            f"    attribute(org.gradle.api.attributes.Attribute.of('org.jetbrains.kotlin.platform.type', String), 'androidJvm')\n"
-            f"    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))\n"
-            f"    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))\n"
-            f"}}\n"
-            f"{config_name}.resolutionStrategy.componentSelection {{\n"
-            f"    all {{ selection ->\n"
-            f"        def n = selection.candidate.module.toLowerCase()\n"
-            f"        def blocked = ['-desktop', '-windows', '-linux', '-macos', '-macosx', '-ios', '-tvos', '-watchos', '-wasm', '-js', '-mingw', '-swing', '-awt'].any {{ n.endsWith(it) }}\n"
-            f"        def g = selection.candidate.group.toLowerCase()\n"
-            f"        if (blocked || g == 'org.jetbrains.compose.desktop') {{\n"
-            f"            selection.reject('Android-only Compose bundle: unsupported platform artifact')\n"
-            f"        }}\n"
-            f"    }}\n"
-            f"}}"
+            f"{config_name}.canBeResolved = true\n"
+            f"{config_name}.canBeConsumed = false"
         )
         for coord in feature["roots"]:
             dependency_lines.append(f"dependencies.add('{config_name}', '{coord}')")
@@ -107,11 +86,15 @@ def main():
         for fid, cname in configurations
     ]
     groovy = f"""
+plugins {{
+    id 'base'
+}}
+
 repositories {{
     google()
     mavenCentral()
-    maven {{ url "https://maven.pkg.jetbrains.space/public/p/compose/dev" }}
-    maven {{ url "https://androidx.dev/storage/compose-mirrors/repository/" }}
+    maven {{ url \"https://maven.pkg.jetbrains.space/public/p/compose/dev\" }}
+    maven {{ url \"https://androidx.dev/storage/compose-mirrors/repository/\" }}
 }}
 {chr(10).join(dependency_lines)}
 
@@ -130,9 +113,9 @@ tasks.register('dumpArtifacts') {{
     run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
-    # Belt-and-suspenders safety check: even if a repository publishes a
-    # malformed variant or a future Gradle change bypasses component selection,
-    # an unsupported platform artifact can never be copied into the bundle.
+    # Belt-and-suspenders Android platform guard. This is deliberately after
+    # Gradle resolution so ordinary AndroidX/JVM dependencies are not rejected
+    # merely because they do not expose a custom Compose platform attribute.
     rejected = []
     for fid, entries in resolved.items():
         kept = []
@@ -148,9 +131,6 @@ tasks.register('dumpArtifacts') {{
         for item in rejected:
             print(f"  - {item['feature']}: {item['coordinate']}")
 
-    # Do not use Path("") here: it becomes '.' and makes the existence check
-    # succeed, which previously caused D8 to receive the project directory as
-    # its --lib instead of the actual Android platform jar.
     android_jar_env = os.environ.get("ANDROID_JAR")
     android_jar = Path(android_jar_env) if android_jar_env else Path()
     if not android_jar_env or not android_jar.is_file():
@@ -171,12 +151,15 @@ tasks.register('dumpArtifacts') {{
             file_meta[f] = entry["module"]
             feature_files[fid].append(f)
             if f not in artifact_by_file:
-                group, name, version = entry["module"].split(":", 2)
+                group, name, _version = entry["module"].split(":", 2)
                 artifact_by_file[f] = f"{group}_{name}".replace(".", "_").replace(":", "_")
 
     d8 = shutil.which("d8")
     if not d8:
-        candidates = sorted(Path(os.environ["ANDROID_SDK_ROOT"]).glob("build-tools/*/d8"))
+        sdk_root = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+        if not sdk_root:
+            raise RuntimeError("ANDROID_SDK_ROOT/ANDROID_HOME is not set and d8 was not found on PATH")
+        candidates = sorted(Path(sdk_root).glob("build-tools/*/d8"))
         if not candidates:
             raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
@@ -193,8 +176,6 @@ tasks.register('dumpArtifacts') {{
             shutil.copy2(src, classes_jar)
 
         if not classes_jar.exists() or classes_jar.stat().st_size == 0:
-            # Some published artifacts are metadata/empty JVM stub artifacts.
-            # They contain no bytecode and therefore have nothing to D8.
             continue
 
         total_input_bytes += classes_jar.stat().st_size
@@ -206,8 +187,6 @@ tasks.register('dumpArtifacts') {{
 
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
         if not dex_files:
-            # D8 can legitimately produce no dex for an empty/metadata-only jar.
-            # Do not make the whole bundle fail merely because classes.dex is absent.
             continue
         if len(dex_files) > 1:
             raise RuntimeError(f"D8 produced multiple dex files for {src.name}: {dex_files}")
