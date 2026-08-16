@@ -119,6 +119,35 @@ tasks.register('dumpArtifacts') {
                 rejected.append({"feature": fid, "coordinate": entry["module"]})
         resolved[fid] = kept
 
+    # Each feature resolves its own configuration, so Gradle's version-conflict
+    # resolution never sees the full graph at once: two features can legally
+    # land on two different versions of the same module (e.g. lifecycle-viewmodel-ktx
+    # pulled in by both navigation-compose and lifecycle-viewmodel-compose).
+    # Artifact IDs are derived from group:name only (no version), so two such
+    # files collide on disk and/or reach D8 as conflicting duplicate classes.
+    # Align every module to a single, highest-resolved version up front.
+    def version_key(version):
+        return tuple((0, int(tok)) if tok.isdigit() else (1, tok) for tok in version.replace("-", ".").split("."))
+
+    canonical = {}
+    for entries in resolved.values():
+        for entry in entries:
+            group, name, version = entry["module"].split(":", 2)
+            key = f"{group}:{name}"
+            if key not in canonical or version_key(version) > version_key(canonical[key]["version"]):
+                canonical[key] = {"version": version, "file": entry["file"], "module": entry["module"]}
+
+    version_conflicts = []
+    for fid, entries in resolved.items():
+        for entry in entries:
+            group, name, version = entry["module"].split(":", 2)
+            key = f"{group}:{name}"
+            chosen = canonical[key]
+            if chosen["version"] != version:
+                version_conflicts.append({"feature": fid, "coordinate": entry["module"], "alignedTo": chosen["module"]})
+            entry["file"] = chosen["file"]
+            entry["module"] = chosen["module"]
+
     sdk = Path(os.environ.get("ANDROID_SDK_ROOT", os.environ.get("ANDROID_HOME", "")))
     android_jar = Path(os.environ.get("ANDROID_JAR", "")) if os.environ.get("ANDROID_JAR") else sdk / "platforms" / ANDROID_PLATFORM / "android.jar"
     if not android_jar.is_file():
@@ -201,7 +230,7 @@ tasks.register('dumpArtifacts') {
 
     manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "uniqueD8InputCount": len(input_jars), "duplicateD8InputCount": len(duplicate_inputs), "duplicates": duplicate_inputs, "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
+    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "uniqueD8InputCount": len(input_jars), "duplicateD8InputCount": len(duplicate_inputs), "duplicates": duplicate_inputs, "versionConflictCount": len(version_conflicts), "versionConflicts": version_conflicts, "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
     (OUT / "resolution-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     archive = OUT / "compose-libs.zip"
@@ -213,7 +242,7 @@ tasks.register('dumpArtifacts') {
                 zf.write(path, path.relative_to(bundle_root))
 
     print(f"Wrote {archive}")
-    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | unique D8 inputs: {len(input_jars)} | duplicates removed: {len(duplicate_inputs)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
+    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | unique D8 inputs: {len(input_jars)} | duplicates removed: {len(duplicate_inputs)} | version conflicts aligned: {len(version_conflicts)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
 
 
 if __name__ == "__main__":
