@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-Resolves the essential Jetpack Compose Maven artifacts, dexes each one
-SEPARATELY (never merged), and packages them into:
- 
-   output/compose-libs.zip        - classes/<artifact-id>.jar + dex/<artifact-id>.dex per artifact
-   output/compose-libraries.json  - manifest describing features + artifacts
- 
-This repo has no dependencyResolutionManagement restrictions, so the
-generated Gradle script is free to declare its own repositories{} block
-(unlike sketchware-pro's monorepo, which uses FAIL_ON_PROJECT_REPOS).
-"""
+"""Build the Jetpack Compose dependency bundle."""
 import json
 import os
 import shutil
@@ -32,8 +22,7 @@ FEATURES = {
     "core": {
         "name": "Compose Core",
         "description": "Required Compose runtime, UI and foundation APIs.",
-        "required": True,
-        "tag": "IMPORTANT",
+        "required": True, "tag": "IMPORTANT",
         "roots": [
             f"androidx.compose.runtime:runtime:{COMPOSE_UI}",
             f"androidx.compose.ui:ui:{COMPOSE_UI}",
@@ -43,43 +32,37 @@ FEATURES = {
     "material3": {
         "name": "Material 3",
         "description": "Material 3 components and theming for Compose.",
-        "required": True,
-        "tag": "IMPORTANT",
+        "required": True, "tag": "IMPORTANT",
         "roots": [f"androidx.compose.material3:material3:{COMPOSE_MATERIAL3}"],
     },
     "activity-compose": {
         "name": "Activity Compose",
         "description": "Integrates Compose content with Android activities.",
-        "required": True,
-        "tag": "IMPORTANT",
+        "required": True, "tag": "IMPORTANT",
         "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"],
     },
     "animation": {
         "name": "Compose Animation",
         "description": "Animation APIs beyond the core foundation set.",
-        "required": False,
-        "tag": "OPTIONAL",
+        "required": False, "tag": "OPTIONAL",
         "roots": [f"androidx.compose.animation:animation:{COMPOSE_UI}"],
     },
     "material-icons": {
         "name": "Material Icons Extended",
         "description": "The full Material icon set for Compose.",
-        "required": False,
-        "tag": "OPTIONAL",
+        "required": False, "tag": "OPTIONAL",
         "roots": [f"androidx.compose.material:material-icons-extended:{COMPOSE_UI}"],
     },
     "navigation-compose": {
         "name": "Navigation Compose",
         "description": "Navigate between composables with a NavHost/NavController.",
-        "required": False,
-        "tag": "OPTIONAL",
+        "required": False, "tag": "OPTIONAL",
         "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"],
     },
     "lifecycle-compose": {
         "name": "Lifecycle ViewModel Compose",
         "description": "ViewModel + lifecycle-aware state collection for Compose.",
-        "required": False,
-        "tag": "OPTIONAL",
+        "required": False, "tag": "OPTIONAL",
         "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"],
     },
 }
@@ -101,15 +84,19 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        # These are standalone resolvable configurations rather than normal
-        # Android configurations, so Gradle otherwise cannot infer which
-        # Compose UI variant the consumer wants. Explicitly request the
-        # Android UI variant to avoid ambiguity between Android and AWT
-        # Skiko variants (for example skiko:0.7.7).
+
+        # These are standalone Gradle configurations, so Gradle has no
+        # Android consumer attributes to use for Compose's multiplatform
+        # publications. Explicitly model an Android runtime consumer.
+        # In particular, ui=android removes Desktop/iOS/etc.; usage=java-runtime
+        # then selects androidRuntimeElements instead of androidApiElements.
         dependency_lines.append(
             f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
             f"{config_name}.attributes {{\n"
             f"    attribute(org.gradle.api.attributes.Attribute.of('ui', String), 'android')\n"
+            f"    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))\n"
+            f"    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))\n"
+            f"    attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, org.gradle.api.attributes.LibraryElements.JAR))\n"
             f"}}"
         )
         for coord in feature["roots"]:
@@ -117,12 +104,10 @@ def main():
 
     resolved_json = WORK / "resolved.json"
     dump_lines = [
-        f"result['{fid}'] = configurations.getByName('{cname}')"
-        f".resolvedConfiguration.resolvedArtifacts.collect {{ a -> "
-        f"[file: a.file.absolutePath, "
-        f"module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}"
+        f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}"
         for fid, cname in configurations
     ]
+
     groovy = f"""
 repositories {{
     google()
@@ -136,20 +121,16 @@ tasks.register('dumpArtifacts') {{
     doLast {{
         def result = [:]
         {chr(10).join(dump_lines)}
-        file('{resolved_json.as_posix()}').text =
-            groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
+        file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
     }}
 }}
 """
+
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
-    
-    # Add settings.gradle to make the directory a valid Gradle project
-    settings_gradle = WORK / "settings.gradle"
-    settings_gradle.write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
-    
-    run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
+    (WORK / "settings.gradle").write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
 
+    run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
     android_jar = Path(os.environ.get("ANDROID_JAR", ""))
@@ -190,14 +171,6 @@ tasks.register('dumpArtifacts') {{
             with zipfile.ZipFile(src) as zf:
                 if "classes.jar" in zf.namelist():
                     classes_jar.write_bytes(zf.read("classes.jar"))
-                res_dir = bundle_root / "res" / aid
-                if any(n.startswith("res/") for n in zf.namelist()):
-                    res_dir.mkdir(parents=True, exist_ok=True)
-                    for name in zf.namelist():
-                        if name.startswith("res/") and not name.endswith("/"):
-                            out = res_dir / name[len("res/"):]
-                            out.parent.mkdir(parents=True, exist_ok=True)
-                            out.write_bytes(zf.read(name))
         else:
             shutil.copy2(src, classes_jar)
 
@@ -216,12 +189,7 @@ tasks.register('dumpArtifacts') {{
     for file, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
         module = file_meta[file]
         group, name, version = module.split(":", 2)
-        artifacts.append({
-            "id": aid,
-            "coordinate": module,
-            "packageName": group,
-            "dependencies": [],
-        })
+        artifacts.append({"id": aid, "coordinate": module, "packageName": group, "dependencies": []})
 
     for fid, feature in FEATURES.items():
         feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid])]
@@ -229,16 +197,10 @@ tasks.register('dumpArtifacts') {{
     manifest = {
         "schemaVersion": 1,
         "composeVersion": COMPOSE_UI,
-        "features": [
-            {"id": fid, **{k: v for k, v in feature.items() if k != "roots"}}
-            for fid, feature in FEATURES.items()
-        ],
+        "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()],
         "artifacts": artifacts,
     }
-
-    (OUT / "compose-libraries.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     archive = OUT / "compose-libs.zip"
     if archive.exists():
