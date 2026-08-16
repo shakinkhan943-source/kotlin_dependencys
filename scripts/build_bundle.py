@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build the Jetpack Compose Android dependency bundle.
 
-Gradle performs normal dependency resolution for the graph.  Compose
-Multiplatform artifacts are handled with targeted substitutions/filters so
-AndroidX/JVM dependencies keep their normal Gradle variant selection.
+Gradle resolves the dependency graph normally. We only apply a narrow
+post-resolution platform filter; we do not add custom Gradle attributes that
+can make ordinary AndroidX dependencies impossible to resolve.
 """
 import json
 import os
@@ -33,9 +33,6 @@ FEATURES = {
     "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
-# These modules are never valid inputs for an Android-only bundle.  Do not
-# reject generic JVM/JVM-stub modules: Android's Kotlin toolchain can need
-# ordinary JVM bytecode and Compose's compiler-facing stubs.
 UNSUPPORTED_ARTIFACT_SUFFIXES = (
     "-desktop", "-windows", "-linux", "-macos", "-macosx", "-ios",
     "-tvos", "-watchos", "-wasm", "-js", "-mingw", "-swing", "-awt",
@@ -44,7 +41,10 @@ UNSUPPORTED_GROUPS = {"org.jetbrains.compose.desktop"}
 
 
 def is_android_artifact(module: str) -> bool:
-    group, name, _version = module.split(":", 2)
+    parts = module.split(":", 2)
+    if len(parts) != 3:
+        return False
+    group, name, _version = parts
     return group.lower() not in UNSUPPORTED_GROUPS and not name.lower().endswith(UNSUPPORTED_ARTIFACT_SUFFIXES)
 
 
@@ -64,81 +64,36 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        dependency_lines.append(
-            f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
-            f"{config_name}.canBeResolved = true\n"
-            f"{config_name}.canBeConsumed = false"
-        )
+        dependency_lines.append(f"configurations.maybeCreate('{config_name}')")
+        dependency_lines.append(f"configurations.getByName('{config_name}').canBeResolved = true")
+        dependency_lines.append(f"configurations.getByName('{config_name}').canBeConsumed = false")
         for coord in feature["roots"]:
             dependency_lines.append(f"dependencies.add('{config_name}', '{coord}')")
 
     resolved_json = WORK / "resolved.json"
-    dump_lines = [
+    collect_lines = [
         f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}"
         for fid, cname in configurations
     ]
 
-    # Compose Multiplatform publishes platform-specific module dependencies
-    # from the same family (for example runtime-desktop).  For an Android
-    # bundle those must map back to the Android Compose module.  This is kept
-    # deliberately narrow: ordinary AndroidX/JVM dependencies are untouched.
-    compose_groups = [
-        "androidx.compose.runtime",
-        "androidx.compose.ui",
-        "androidx.compose.foundation",
-        "androidx.compose.animation",
-        "androidx.compose.material",
-        "androidx.compose.material3",
-    ]
-    compose_group_literal = ", ".join(repr(g) for g in compose_groups)
-    groovy = f"""
-plugins {{
+    # Deliberately use plain Gradle resolution. Previous attempts added
+    # synthetic variant attributes and substitutions, which caused Gradle to
+    # reject ordinary AndroidX dependencies or produce Groovy syntax errors.
+    # Android-only enforcement happens after the graph is successfully
+    # resolved, where we can safely inspect the concrete artifact names.
+    groovy = """plugins {
     id 'base'
-}}
+}
 
-repositories {{
+repositories {
     google()
     mavenCentral()
-    maven {{ url \"https://maven.pkg.jetbrains.space/public/p/compose/dev\" }}
-    maven {{ url \"https://androidx.dev/storage/compose-mirrors/repository/\" }}
-}}
-{chr(10).join(dependency_lines)}
+    maven { url 'https://maven.pkg.jetbrains.space/public/p/compose/dev' }
+    maven { url 'https://androidx.dev/storage/compose-mirrors/repository/' }
+}
 
-// Reject explicit desktop/other-platform Compose modules before Gradle tries
-// to resolve their own platform graph.  For Compose families, the Android
-// module is the same module name without the platform suffix.
-configurations.configureEach {{ cfg ->
-    cfg.resolutionStrategy.eachDependency {{ details ->
-        def g = details.requested.group
-        def n = details.requested.name
-        if (g != null && {compose_group_literal}.contains(g) && n.endsWith('-desktop')) {{
-            def androidName = n.substring(0, n.length() - '-desktop'.length())
-            details.useTarget(\"${{g}}:${{androidName}}:${{details.requested.version}}\")
-            details.because('Android-only Compose bundle: replace desktop Compose module with its Android module')
-        }}
-    }}
-}}
+""" + "\n".join(dependency_lines) + "\n\ntasks.register('dumpArtifacts') {\n    doLast {\n        def result = [:]\n" + "\n".join("        " + line for line in collect_lines) + "\n" + f"        file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))\n" + "    }\n}\n"
 
-// Skiko is the one important native/variant dependency in the observed
-// Compose graph.  Prefer its Android artifact when a published desktop/AWT
-// variant would otherwise be ambiguous.  This is a targeted rule, not a
-// global Android platform attribute, so AndroidX libraries remain resolvable.
-configurations.configureEach {{ cfg ->
-    cfg.resolutionStrategy.dependencySubstitution {{ substitutions ->
-        substitutions.substitute(module('org.jetbrains.skiko:skiko:0.7.7'))
-            .using(module('org.jetbrains.skiko:skiko-android:0.7.7'))
-            .because('Android-only Compose bundle: use Skiko Android artifact')
-    }}
-}}
-
-tasks.register('dumpArtifacts') {{
-    doLast {{
-        def result = [:]
-        {chr(10).join(dump_lines)}
-        file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
-    }}
-}}
-"""
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
     (WORK / "settings.gradle").write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
@@ -182,7 +137,7 @@ tasks.register('dumpArtifacts') {{
             feature_files[fid].append(f)
             if f not in artifact_by_file:
                 group, name, _version = entry["module"].split(":", 2)
-                artifact_by_file[f] = f"{group}_{name}".replace(".", "_").replace(":", "_")
+                artifact_by_file[f] = f"{group}_{name}".replace(".", "_")
 
     d8 = shutil.which("d8")
     if not d8:
@@ -222,7 +177,7 @@ tasks.register('dumpArtifacts') {{
     artifacts = []
     for file, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
         module = file_meta[file]
-        group, name, version = module.split(":", 2)
+        group, _name, _version = module.split(":", 2)
         artifacts.append({"id": aid, "coordinate": module, "packageName": group, "dependencies": []})
     for fid, feature in FEATURES.items():
         feature["artifacts"] = [artifact_by_file[f] for f in sorted(feature_files[fid])]
