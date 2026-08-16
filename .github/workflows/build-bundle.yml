@@ -50,6 +50,34 @@ jobs:
           COMPOSE_MATERIAL3_VERSION: ${{ github.event.inputs.material3_version || '1.3.1' }}
         run: python3 scripts/build_bundle.py
 
+      - name: Verify Android-only bundle
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("output/resolution-report.json").read_text())
+          assert report["androidOnly"] is True
+          assert report["rejectedArtifactCount"] == len(report["rejectedArtifacts"])
+
+          bad = [
+              a["coordinate"]
+              for a in report["rejectedArtifacts"]
+              if any(a["coordinate"].split(":", 2)[1].lower().endswith(s) for s in (
+                  "-desktop", "-windows", "-linux", "-macos", "-macosx",
+                  "-ios", "-tvos", "-watchos", "-wasm", "-js", "-mingw",
+                  "-swing", "-awt"
+              ))
+          ]
+          if bad:
+              print("Rejected platform artifacts:")
+              print("\n".join(f"  - {x}" for x in bad))
+
+          print(f"Android artifacts: {report['artifactCount']}")
+          print(f"Rejected unsupported artifacts: {report['rejectedArtifactCount']}")
+          print(f"D8 input: {report['d8InputBytes'] / (1024 * 1024):.1f} MiB")
+          PY
+
       # Downloadable from the run's "Artifacts" section, kept for 90 days.
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
@@ -58,6 +86,7 @@ jobs:
           path: |
             output/compose-libs.zip
             output/compose-libraries.json
+            output/resolution-report.json
           if-no-files-found: error
 
       # Also published as a Release so `gh release download` / a stable
@@ -68,7 +97,7 @@ jobs:
         run: |
           TAG="bundle-${{ github.run_number }}"
           gh release create "$TAG" \
-            output/compose-libs.zip output/compose-libraries.json \
+            output/compose-libs.zip output/compose-libraries.json output/resolution-report.json \
             --title "Compose bundle #${{ github.run_number }}" \
             --notes "Generated from commit ${{ github.sha }}" \
             --latest
