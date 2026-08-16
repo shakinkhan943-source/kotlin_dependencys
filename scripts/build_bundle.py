@@ -131,6 +131,11 @@ tasks.register('dumpArtifacts') {{
 """
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
+    
+    # Add settings.gradle to make the directory a valid Gradle project
+    settings_gradle = WORK / "settings.gradle"
+    settings_gradle.write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
+    
     run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
 
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
