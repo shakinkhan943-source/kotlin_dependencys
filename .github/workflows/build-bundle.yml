@@ -1,0 +1,74 @@
+name: Build Compose dependency bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      compose_ui_version:
+        description: "androidx.compose.* version"
+        default: "1.7.8"
+      material3_version:
+        description: "androidx.compose.material3 version"
+        default: "1.3.1"
+  push:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/build-bundle.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Build bundle
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+          COMPOSE_UI_VERSION: ${{ github.event.inputs.compose_ui_version || '1.7.8' }}
+          COMPOSE_MATERIAL3_VERSION: ${{ github.event.inputs.material3_version || '1.3.1' }}
+        run: python3 scripts/build_bundle.py
+
+      # Downloadable from the run's "Artifacts" section, kept for 90 days.
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-bundle
+          path: |
+            output/compose-libs.zip
+            output/compose-libraries.json
+          if-no-files-found: error
+
+      # Also published as a Release so `gh release download` / a stable
+      # URL works, instead of having to open a specific run each time.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="bundle-${{ github.run_number }}"
+          gh release create "$TAG" \
+            output/compose-libs.zip output/compose-libraries.json \
+            --title "Compose bundle #${{ github.run_number }}" \
+            --notes "Generated from commit ${{ github.sha }}" \
+            --latest
