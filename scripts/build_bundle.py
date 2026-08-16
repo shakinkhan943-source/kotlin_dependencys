@@ -6,6 +6,7 @@ normal Android/JVM transitive graph. All resolved bytecode is then supplied to
 one D8 invocation so cross-library references are resolved together and the
 bundle can contain classes.dex, classes2.dex, etc. as required.
 """
+import hashlib
 import json
 import os
 import shutil
@@ -44,6 +45,14 @@ def is_android_artifact(coordinate):
         return False
     group, name, _version = parts
     return group.lower() not in UNSUPPORTED_GROUPS and not name.lower().endswith(UNSUPPORTED_SUFFIXES)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def run(*args):
@@ -127,7 +136,7 @@ tasks.register('dumpArtifacts') {
     for fid, entries in resolved.items():
         feature_files[fid] = []
         for entry in entries:
-            f = entry["file"]
+            f = str(Path(entry["file"]).resolve())
             feature_files[fid].append(f)
             file_meta[f] = entry["module"]
             if f not in artifact_by_file:
@@ -141,10 +150,13 @@ tasks.register('dumpArtifacts') {
             raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
 
-    # Convert every AAR/JAR to a plain classes JAR first. D8 must receive the
-    # complete classpath in one invocation so references between libraries are
-    # resolved together. It may emit multiple dex files; that is expected.
+    # Materialize each artifact once, then deduplicate byte-identical class
+    # archives. Different Gradle artifact records can point at the same file,
+    # or different files can contain exactly the same classes. Feeding either
+    # duplicate to D8 causes duplicate-class errors.
     input_jars = []
+    seen_hashes = {}
+    duplicate_inputs = []
     total_input_bytes = 0
     for source, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
         src = Path(source)
@@ -160,13 +172,19 @@ tasks.register('dumpArtifacts') {
             continue
         if not classes_jar.exists() or classes_jar.stat().st_size == 0:
             continue
+
+        digest = sha256_file(classes_jar)
+        if digest in seen_hashes:
+            duplicate_inputs.append({"artifact": aid, "duplicateOf": seen_hashes[digest], "sha256": digest})
+            classes_jar.unlink()
+            continue
+        seen_hashes[digest] = aid
         input_jars.append(classes_jar)
         total_input_bytes += classes_jar.stat().st_size
 
     if not input_jars:
         raise RuntimeError("No Android bytecode artifacts were collected for D8")
 
-    # One D8 invocation for the complete dependency graph.
     run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_dir, *input_jars)
     dex_files = sorted(dex_dir.glob("classes*.dex"), key=lambda p: (p.name != "classes.dex", p.name))
     if not dex_files:
@@ -183,7 +201,7 @@ tasks.register('dumpArtifacts') {
 
     manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k: v for k, v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts}
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
+    report = {"androidOnly": True, "resolutionStrategy": "explicit-android-artifacts", "composeVersion": COMPOSE_UI, "material3Version": COMPOSE_MATERIAL3, "artifactCount": len(artifacts), "uniqueD8InputCount": len(input_jars), "duplicateD8InputCount": len(duplicate_inputs), "duplicates": duplicate_inputs, "rejectedArtifactCount": len(rejected), "rejectedArtifacts": rejected, "d8InputBytes": total_input_bytes, "dexFileCount": len(dex_files), "dexFiles": [p.name for p in dex_files]}
     (OUT / "resolution-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     archive = OUT / "compose-libs.zip"
@@ -195,7 +213,7 @@ tasks.register('dumpArtifacts') {
                 zf.write(path, path.relative_to(bundle_root))
 
     print(f"Wrote {archive}")
-    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
+    print(f"Android artifacts: {len(artifacts)} | rejected: {len(rejected)} | unique D8 inputs: {len(input_jars)} | duplicates removed: {len(duplicate_inputs)} | D8 input: {total_input_bytes / (1024 * 1024):.1f} MiB | dex files: {len(dex_files)}")
 
 
 if __name__ == "__main__":
