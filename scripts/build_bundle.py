@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Build the Jetpack Compose Android dependency bundle.
 
-The resolver intentionally lets Gradle perform normal variant-aware dependency
-resolution. Android-only filtering is applied after resolution as a safety net;
-we do not add a custom `ui=android` attribute because most AndroidX/JVM
-libraries do not publish that attribute and it can make valid dependencies
-unresolvable.
+Gradle performs normal dependency resolution for the graph.  Compose
+Multiplatform artifacts are handled with targeted substitutions/filters so
+AndroidX/JVM dependencies keep their normal Gradle variant selection.
 """
 import json
 import os
@@ -35,9 +33,9 @@ FEATURES = {
     "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
-# These are platform/toolkit artifacts that must never enter an Android-only
-# bundle. Do NOT reject every artifact containing "jvm" or "jvmstubs": some
-# JVM bytecode/stubs can legitimately be required by the Android compiler.
+# These modules are never valid inputs for an Android-only bundle.  Do not
+# reject generic JVM/JVM-stub modules: Android's Kotlin toolchain can need
+# ordinary JVM bytecode and Compose's compiler-facing stubs.
 UNSUPPORTED_ARTIFACT_SUFFIXES = (
     "-desktop", "-windows", "-linux", "-macos", "-macosx", "-ios",
     "-tvos", "-watchos", "-wasm", "-js", "-mingw", "-swing", "-awt",
@@ -47,9 +45,7 @@ UNSUPPORTED_GROUPS = {"org.jetbrains.compose.desktop"}
 
 def is_android_artifact(module: str) -> bool:
     group, name, _version = module.split(":", 2)
-    if group.lower() in UNSUPPORTED_GROUPS:
-        return False
-    return not name.lower().endswith(UNSUPPORTED_ARTIFACT_SUFFIXES)
+    return group.lower() not in UNSUPPORTED_GROUPS and not name.lower().endswith(UNSUPPORTED_ARTIFACT_SUFFIXES)
 
 
 def run(*args):
@@ -68,10 +64,6 @@ def main():
     for feature_id, feature in FEATURES.items():
         config_name = "compose_" + feature_id.replace("-", "_")
         configurations.append((feature_id, config_name))
-        # IMPORTANT: no custom `ui=android` or Kotlin platform attribute here.
-        # Normal Gradle variant matching is allowed to resolve AndroidX and
-        # Kotlin dependencies. Unsupported Compose platform artifacts are
-        # removed after resolution by the Python safety filter below.
         dependency_lines.append(
             f"def {config_name} = configurations.maybeCreate('{config_name}')\n"
             f"{config_name}.canBeResolved = true\n"
@@ -85,6 +77,20 @@ def main():
         f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}"
         for fid, cname in configurations
     ]
+
+    # Compose Multiplatform publishes platform-specific module dependencies
+    # from the same family (for example runtime-desktop).  For an Android
+    # bundle those must map back to the Android Compose module.  This is kept
+    # deliberately narrow: ordinary AndroidX/JVM dependencies are untouched.
+    compose_groups = [
+        "androidx.compose.runtime",
+        "androidx.compose.ui",
+        "androidx.compose.foundation",
+        "androidx.compose.animation",
+        "androidx.compose.material",
+        "androidx.compose.material3",
+    ]
+    compose_group_literal = ", ".join(repr(g) for g in compose_groups)
     groovy = f"""
 plugins {{
     id 'base'
@@ -97,6 +103,33 @@ repositories {{
     maven {{ url \"https://androidx.dev/storage/compose-mirrors/repository/\" }}
 }}
 {chr(10).join(dependency_lines)}
+
+// Reject explicit desktop/other-platform Compose modules before Gradle tries
+// to resolve their own platform graph.  For Compose families, the Android
+// module is the same module name without the platform suffix.
+configurations.configureEach {{ cfg ->
+    cfg.resolutionStrategy.eachDependency {{ details ->
+        def g = details.requested.group
+        def n = details.requested.name
+        if (g != null && {compose_group_literal}.contains(g) && n.endsWith('-desktop')) {{
+            def androidName = n.substring(0, n.length() - '-desktop'.length())
+            details.useTarget(\"${{g}}:${{androidName}}:${{details.requested.version}}\")
+            details.because('Android-only Compose bundle: replace desktop Compose module with its Android module')
+        }}
+    }}
+}}
+
+// Skiko is the one important native/variant dependency in the observed
+// Compose graph.  Prefer its Android artifact when a published desktop/AWT
+// variant would otherwise be ambiguous.  This is a targeted rule, not a
+// global Android platform attribute, so AndroidX libraries remain resolvable.
+configurations.configureEach {{ cfg ->
+    cfg.resolutionStrategy.dependencySubstitution {{ substitutions ->
+        substitutions.substitute(module('org.jetbrains.skiko:skiko:0.7.7'))
+            .using(module('org.jetbrains.skiko:skiko-android:0.7.7'))
+            .because('Android-only Compose bundle: use Skiko Android artifact')
+    }}
+}}
 
 tasks.register('dumpArtifacts') {{
     doLast {{
@@ -113,9 +146,6 @@ tasks.register('dumpArtifacts') {{
     run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
-    # Belt-and-suspenders Android platform guard. This is deliberately after
-    # Gradle resolution so ordinary AndroidX/JVM dependencies are not rejected
-    # merely because they do not expose a custom Compose platform attribute.
     rejected = []
     for fid, entries in resolved.items():
         kept = []
@@ -174,17 +204,14 @@ tasks.register('dumpArtifacts') {{
                     classes_jar.write_bytes(zf.read("classes.jar"))
         else:
             shutil.copy2(src, classes_jar)
-
         if not classes_jar.exists() or classes_jar.stat().st_size == 0:
             continue
-
         total_input_bytes += classes_jar.stat().st_size
         dex_tmp = WORK / "dex-tmp"
         if dex_tmp.exists():
             shutil.rmtree(dex_tmp)
         dex_tmp.mkdir()
         run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_tmp, classes_jar)
-
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
         if not dex_files:
             continue
