@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build a curated Android-only Jetpack Compose dependency bundle."""
+import hashlib
 import json
 import os
 import shutil
 import subprocess
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -18,9 +18,6 @@ NAVIGATION_COMPOSE = os.environ.get("NAVIGATION_COMPOSE_VERSION", "2.8.5")
 LIFECYCLE_COMPOSE = os.environ.get("LIFECYCLE_COMPOSE_VERSION", "2.8.7")
 ANDROID_PLATFORM = os.environ.get("ANDROID_COMPILE_SDK", "android-36")
 
-# Curated roots. Gradle resolves their real Android/JVM support graph, but the
-# final manifest exposes only these user-selectable features. Kotlin/coroutines
-# are deliberately not roots because Sketchware Pro already provides them.
 FEATURES = {
     "core": {"name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.", "required": True, "tag": "IMPORTANT", "roots": [
         f"androidx.compose.runtime:runtime-android:{COMPOSE_UI}",
@@ -36,8 +33,6 @@ FEATURES = {
     "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
 }
 
-# Libraries already supplied by Sketchware Pro. They may still appear as
-# Gradle transitives, but they are not copied into the built-in bundle.
 SKIP_COORDINATE_PREFIXES = (
     "org.jetbrains.kotlin:kotlin-stdlib",
     "org.jetbrains.kotlin:kotlin-stdlib-common",
@@ -64,18 +59,20 @@ def main():
     if WORK.exists(): shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
-    configurations, dependency_lines = [], []
-    for fid, feature in FEATURES.items():
-        cname = "compose_" + fid.replace("-", "_")
-        configurations.append((fid, cname))
-        dependency_lines.append(f"def {cname} = configurations.maybeCreate('{cname}')")
-        dependency_lines.append(f"{cname}.attributes {{ attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME)); attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY)) }}")
-        for coord in feature["roots"]: dependency_lines.append(f"dependencies.add('{cname}', '{coord}')")
+
+    # Resolve every selected root in ONE configuration. Gradle then performs
+    # one global conflict resolution, so activity/lifecycle/core versions are
+    # not collected separately and mixed together.
+    roots = [root for feature in FEATURES.values() for root in feature["roots"]]
+    root_lines = "\n".join(f"dependencies.add('composeAll', '{root}')" for root in roots)
     resolved_json = WORK / "resolved.json"
-    dump_lines = [f"result['{fid}'] = configurations.getByName('{cname}').resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}" for fid, cname in configurations]
     groovy = f'''repositories {{ google(); mavenCentral() }}
-{chr(10).join(dependency_lines)}
-tasks.register('dumpArtifacts') {{ doLast {{ def result = [:]; {chr(10).join(dump_lines)}; file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result)) }} }}
+def composeAll = configurations.maybeCreate('composeAll')
+composeAll.canBeResolved = true
+composeAll.canBeConsumed = false
+composeAll.attributes {{ attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME)); attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY)); attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, org.gradle.api.attributes.LibraryElements.AAR)) }}
+{root_lines}
+tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}; file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result)) }} }}
 '''
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
@@ -95,57 +92,86 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = [:]; {chr(10).join(dum
     bundle_root = WORK / "bundle"
     (bundle_root / "classes").mkdir(parents=True)
     (bundle_root / "dex").mkdir(parents=True)
-    artifact_by_file, file_meta, feature_files = {}, {}, {fid: [] for fid in FEATURES}
-    rejected = []
-    for fid, entries in resolved.items():
-        for entry in entries:
-            f, module = entry["file"], entry["module"]
-            if excluded(module):
-                rejected.append(module); continue
-            file_meta[f] = module
-            if f not in artifact_by_file:
-                group, name, version = module.split(":", 2)
-                artifact_by_file[f] = f"{group}_{name}".replace(".", "_")
-            feature_files[fid].append(f)
 
-    # Deduplicate byte-identical artifacts before D8.
-    import hashlib
-    unique = {}
+    # First filter the globally resolved graph, then keep one coordinate per
+    # module. A Gradle-resolved graph already has one selected version per
+    # module, so we never mix old/new activity, lifecycle, core, etc.
+    selected = {}
+    rejected = []
+    for entry in resolved:
+        file, module = entry["file"], entry["module"]
+        if excluded(module):
+            rejected.append(module)
+            continue
+        group, name, version = module.split(":", 2)
+        key = f"{group}:{name}"
+        selected[key] = {"file": file, "module": module}
+
+    # Byte-identical AAR/JARs are also removed.
+    unique_by_hash = {}
     duplicate_count = 0
-    for file in artifact_by_file:
-        data = Path(file).read_bytes()
-        digest = hashlib.sha256(data).hexdigest()
-        if digest in unique:
+    final_entries = []
+    for key, entry in sorted(selected.items()):
+        digest = hashlib.sha256(Path(entry["file"]).read_bytes()).hexdigest()
+        if digest in unique_by_hash:
             duplicate_count += 1
             continue
-        unique[digest] = file
-    artifact_by_file = {f: artifact_by_file[f] for f in unique.values()}
+        unique_by_hash[digest] = key
+        final_entries.append(entry)
 
-    for file, aid in artifact_by_file.items():
-        src = Path(file)
+    artifact_ids = {}
+    artifacts = []
+    dex_count = 0
+    for entry in final_entries:
+        src = Path(entry["file"])
+        group, name, version = entry["module"].split(":", 2)
+        aid = f"{group}_{name}".replace(".", "_").replace("-", "_")
+        artifact_ids[entry["module"]] = aid
         classes_jar = bundle_root / "classes" / f"{aid}.jar"
-        if src.suffix == ".aar":
+        if src.suffix.lower() == ".aar":
             with zipfile.ZipFile(src) as zf:
-                if "classes.jar" not in zf.namelist(): continue
+                if "classes.jar" not in zf.namelist():
+                    continue
                 classes_jar.write_bytes(zf.read("classes.jar"))
-        else: shutil.copy2(src, classes_jar)
-        if not classes_jar.exists() or classes_jar.stat().st_size == 0: continue
+        else:
+            shutil.copy2(src, classes_jar)
+        if not classes_jar.exists() or classes_jar.stat().st_size == 0:
+            continue
         dex_tmp = WORK / "dex-tmp"
         if dex_tmp.exists(): shutil.rmtree(dex_tmp)
         dex_tmp.mkdir()
         run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_tmp, classes_jar)
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
-        if not dex_files: continue
-        if len(dex_files) > 1: raise RuntimeError(f"D8 produced multiple dex files for {src.name}")
-        shutil.move(dex_files[0], bundle_root / "dex" / f"{aid}.dex")
+        if len(dex_files) != 1:
+            raise RuntimeError(f"Expected one DEX for {entry['module']}, got {len(dex_files)}")
+        dex_path = bundle_root / "dex" / f"{aid}.dex"
+        shutil.move(dex_files[0], dex_path)
+        dex_count += 1
+        artifacts.append({"id": aid, "coordinate": entry["module"], "packageName": group, "dependencies": []})
 
-    artifacts = []
-    for file, aid in sorted(artifact_by_file.items(), key=lambda item: item[1]):
-        module = file_meta[file]
-        group, name, version = module.split(":", 2)
-        artifacts.append({"id": aid, "coordinate": module, "packageName": group, "dependencies": []})
-    for fid, feature in FEATURES.items(): feature["artifacts"] = [artifact_by_file[f] for f in feature_files[fid] if f in artifact_by_file]
-    manifest = {"schemaVersion": 1, "composeVersion": COMPOSE_UI, "features": [{"id": fid, **{k:v for k,v in feature.items() if k != "roots"}} for fid, feature in FEATURES.items()], "artifacts": artifacts, "skippedBuiltInDependencies": list(SKIP_COORDINATE_PREFIXES), "rejectedPlatformArtifacts": sorted(set(rejected)), "buildStats": {"uniqueArtifacts": len(artifact_by_file), "duplicateArtifactsRemoved": duplicate_count}}
+    # Features point to the final globally-resolved artifacts. This is only
+    # metadata for SK's selector; support dependencies are not user toggles.
+    feature_meta = []
+    for fid, feature in FEATURES.items():
+        roots_for_feature = []
+        for root in feature["roots"]:
+            parts = root.split(":")
+            root_key = f"{parts[0]}:{parts[1]}"
+            for artifact in artifacts:
+                if artifact["coordinate"].startswith(root_key + ":"):
+                    roots_for_feature.append(artifact["id"])
+        feature_meta.append({"id": fid, "name": feature["name"], "description": feature["description"], "required": feature["required"], "tag": feature["tag"], "roots": roots_for_feature})
+
+    manifest = {
+        "schemaVersion": 2,
+        "composeVersion": COMPOSE_UI,
+        "material3Version": COMPOSE_MATERIAL3,
+        "features": feature_meta,
+        "artifacts": artifacts,
+        "skippedBuiltInDependencies": list(SKIP_COORDINATE_PREFIXES),
+        "rejectedPlatformArtifacts": sorted(set(rejected)),
+        "buildStats": {"globallyResolvedArtifacts": len(resolved), "uniqueArtifacts": len(artifacts), "duplicateArtifactsRemoved": duplicate_count, "dexFiles": dex_count},
+    }
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     archive = OUT / "compose-libs.zip"
     if archive.exists(): archive.unlink()
@@ -154,4 +180,6 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = [:]; {chr(10).join(dum
             if path.is_file(): zf.write(path, path.relative_to(bundle_root))
     print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
