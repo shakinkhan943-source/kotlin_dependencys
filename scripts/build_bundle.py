@@ -19,12 +19,7 @@ LIFECYCLE_COMPOSE = os.environ.get("LIFECYCLE_COMPOSE_VERSION", "2.8.7")
 ANDROID_PLATFORM = os.environ.get("ANDROID_COMPILE_SDK", "android-36")
 
 FEATURES = {
-    "core": {"name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.", "required": True, "tag": "IMPORTANT", "roots": [
-        f"androidx.compose.runtime:runtime-android:{COMPOSE_UI}",
-        f"androidx.compose.runtime:runtime-saveable-android:{COMPOSE_UI}",
-        f"androidx.compose.ui:ui-android:{COMPOSE_UI}",
-        f"androidx.compose.foundation:foundation-android:{COMPOSE_UI}",
-    ]},
+    "core": {"name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.runtime:runtime-android:{COMPOSE_UI}", f"androidx.compose.runtime:runtime-saveable-android:{COMPOSE_UI}", f"androidx.compose.ui:ui-android:{COMPOSE_UI}", f"androidx.compose.foundation:foundation-android:{COMPOSE_UI}"]},
     "material3": {"name": "Material 3", "description": "Material 3 components and theming for Compose.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.material3:material3-android:{COMPOSE_MATERIAL3}"]},
     "activity-compose": {"name": "Activity Compose", "description": "Integrates Compose content with Android activities.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"]},
     "animation": {"name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.animation:animation-android:{COMPOSE_UI}"]},
@@ -60,9 +55,8 @@ def main():
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
 
-    # Resolve every selected root in ONE configuration. Gradle then performs
-    # one global conflict resolution, so activity/lifecycle/core versions are
-    # not collected separately and mixed together.
+    # Resolve every selected root in ONE configuration. Gradle performs one
+    # global conflict resolution instead of mixing separately resolved graphs.
     roots = [root for feature in FEATURES.values() for root in feature["roots"]]
     root_lines = "\n".join(f"dependencies.add('composeAll', '{root}')" for root in roots)
     resolved_json = WORK / "resolved.json"
@@ -70,7 +64,7 @@ def main():
 def composeAll = configurations.maybeCreate('composeAll')
 composeAll.canBeResolved = true
 composeAll.canBeConsumed = false
-composeAll.attributes {{ attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME)); attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY)); attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, org.gradle.api.attributes.LibraryElements.AAR)) }}
+composeAll.attributes {{ attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME)); attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY)) }}
 {root_lines}
 tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}; file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result)) }} }}
 '''
@@ -93,9 +87,8 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
     (bundle_root / "classes").mkdir(parents=True)
     (bundle_root / "dex").mkdir(parents=True)
 
-    # First filter the globally resolved graph, then keep one coordinate per
-    # module. A Gradle-resolved graph already has one selected version per
-    # module, so we never mix old/new activity, lifecycle, core, etc.
+    # Gradle has already selected one version per module. Filter only after
+    # that resolution, then deduplicate identical bytecode.
     selected = {}
     rejected = []
     for entry in resolved:
@@ -104,10 +97,8 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
             rejected.append(module)
             continue
         group, name, version = module.split(":", 2)
-        key = f"{group}:{name}"
-        selected[key] = {"file": file, "module": module}
+        selected[f"{group}:{name}"] = {"file": file, "module": module}
 
-    # Byte-identical AAR/JARs are also removed.
     unique_by_hash = {}
     duplicate_count = 0
     final_entries = []
@@ -119,24 +110,20 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         unique_by_hash[digest] = key
         final_entries.append(entry)
 
-    artifact_ids = {}
     artifacts = []
     dex_count = 0
     for entry in final_entries:
         src = Path(entry["file"])
         group, name, version = entry["module"].split(":", 2)
         aid = f"{group}_{name}".replace(".", "_").replace("-", "_")
-        artifact_ids[entry["module"]] = aid
         classes_jar = bundle_root / "classes" / f"{aid}.jar"
         if src.suffix.lower() == ".aar":
             with zipfile.ZipFile(src) as zf:
-                if "classes.jar" not in zf.namelist():
-                    continue
+                if "classes.jar" not in zf.namelist(): continue
                 classes_jar.write_bytes(zf.read("classes.jar"))
         else:
             shutil.copy2(src, classes_jar)
-        if not classes_jar.exists() or classes_jar.stat().st_size == 0:
-            continue
+        if not classes_jar.exists() or classes_jar.stat().st_size == 0: continue
         dex_tmp = WORK / "dex-tmp"
         if dex_tmp.exists(): shutil.rmtree(dex_tmp)
         dex_tmp.mkdir()
@@ -144,22 +131,17 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
         if len(dex_files) != 1:
             raise RuntimeError(f"Expected one DEX for {entry['module']}, got {len(dex_files)}")
-        dex_path = bundle_root / "dex" / f"{aid}.dex"
-        shutil.move(dex_files[0], dex_path)
+        shutil.move(dex_files[0], bundle_root / "dex" / f"{aid}.dex")
         dex_count += 1
         artifacts.append({"id": aid, "coordinate": entry["module"], "packageName": group, "dependencies": []})
 
-    # Features point to the final globally-resolved artifacts. This is only
-    # metadata for SK's selector; support dependencies are not user toggles.
     feature_meta = []
     for fid, feature in FEATURES.items():
         roots_for_feature = []
         for root in feature["roots"]:
             parts = root.split(":")
             root_key = f"{parts[0]}:{parts[1]}"
-            for artifact in artifacts:
-                if artifact["coordinate"].startswith(root_key + ":"):
-                    roots_for_feature.append(artifact["id"])
+            roots_for_feature += [a["id"] for a in artifacts if a["coordinate"].startswith(root_key + ":")]
         feature_meta.append({"id": fid, "name": feature["name"], "description": feature["description"], "required": feature["required"], "tag": feature["tag"], "roots": roots_for_feature})
 
     manifest = {
@@ -181,5 +163,4 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
     print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
