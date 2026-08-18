@@ -50,6 +50,15 @@ def excluded(coord):
     return c.startswith(SKIP_COORDINATE_PREFIXES) or any(token in c for token in PLATFORM_TOKENS) or "skiko" in c
 
 
+def jar_has_classes(path):
+    """Return True only when the extracted/copied JAR actually contains class files."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return any(n.endswith(".class") for n in zf.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
 def main():
     if WORK.exists(): shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
@@ -111,6 +120,7 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         final_entries.append(entry)
 
     artifacts = []
+    skipped_no_classes = []
     dex_count = 0
     for entry in final_entries:
         src = Path(entry["file"])
@@ -119,20 +129,36 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         classes_jar = bundle_root / "classes" / f"{aid}.jar"
         if src.suffix.lower() == ".aar":
             with zipfile.ZipFile(src) as zf:
-                if "classes.jar" not in zf.namelist(): continue
+                if "classes.jar" not in zf.namelist():
+                    skipped_no_classes.append(entry["module"])
+                    continue
                 classes_jar.write_bytes(zf.read("classes.jar"))
         else:
             shutil.copy2(src, classes_jar)
-        if not classes_jar.exists() or classes_jar.stat().st_size == 0: continue
+        if not classes_jar.exists() or classes_jar.stat().st_size == 0 or not jar_has_classes(classes_jar):
+            skipped_no_classes.append(entry["module"])
+            continue
+
         dex_tmp = WORK / "dex-tmp"
         if dex_tmp.exists(): shutil.rmtree(dex_tmp)
-        dex_tmp.mkdir()
+        dex_tmp.mkdir(parents=True)
         run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_tmp, classes_jar)
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
-        if len(dex_files) != 1:
-            raise RuntimeError(f"Expected one DEX for {entry['module']}, got {len(dex_files)}")
-        shutil.move(dex_files[0], bundle_root / "dex" / f"{aid}.dex")
-        dex_count += 1
+        # Some resolved Android artifacts are metadata/empty modules. They are
+        # valid Gradle dependencies but have no bytecode to ship in a DEX bundle.
+        if not dex_files:
+            skipped_no_classes.append(entry["module"])
+            continue
+        # Normal Compose/AndroidX artifacts should fit in one DEX. If a future
+        # artifact exceeds the limit, preserve all DEX outputs rather than
+        # silently losing bytecode.
+        if len(dex_files) == 1:
+            shutil.move(dex_files[0], bundle_root / "dex" / f"{aid}.dex")
+        else:
+            for index, dex_file in enumerate(dex_files, 1):
+                suffix = "" if index == 1 else str(index)
+                shutil.move(dex_file, bundle_root / "dex" / f"{aid}{suffix}.dex")
+        dex_count += len(dex_files)
         artifacts.append({"id": aid, "coordinate": entry["module"], "packageName": group, "dependencies": []})
 
     feature_meta = []
@@ -142,7 +168,7 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
             parts = root.split(":")
             root_key = f"{parts[0]}:{parts[1]}"
             roots_for_feature += [a["id"] for a in artifacts if a["coordinate"].startswith(root_key + ":")]
-        feature_meta.append({"id": fid, "name": feature["name"], "description": feature["description"], "required": feature["required"], "tag": feature["tag"], "roots": roots_for_feature})
+        feature_meta.append({"id": fid, "name": feature["name"], "description": feature["description"], "required": feature["required"], "tag": feature["tag"], "roots": sorted(set(roots_for_feature))})
 
     manifest = {
         "schemaVersion": 2,
@@ -152,6 +178,7 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         "artifacts": artifacts,
         "skippedBuiltInDependencies": list(SKIP_COORDINATE_PREFIXES),
         "rejectedPlatformArtifacts": sorted(set(rejected)),
+        "skippedNoBytecodeArtifacts": sorted(set(skipped_no_classes)),
         "buildStats": {"globallyResolvedArtifacts": len(resolved), "uniqueArtifacts": len(artifacts), "duplicateArtifactsRemoved": duplicate_count, "dexFiles": dex_count},
     }
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
