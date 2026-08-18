@@ -63,14 +63,11 @@ def main():
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
 
-    # Resolve the complete graph in ONE Gradle configuration. The important
-    # part is using the Android runtime variant instead of a generic JVM
-    # variant. AndroidX/Compose's variant-aware metadata then selects the
-    # corresponding *-android artifacts (ui-text-android, ui-util-android,
-    # ui-graphics-android, ui-unit-android, ui-geometry-android, etc.).
     roots = [root for feature in FEATURES.values() for root in feature["roots"]]
     root_lines = "\n".join(f"dependencies.add('composeAll', '{root}')" for root in roots)
     resolved_json = WORK / "resolved.json"
+    # LibraryElements has no Groovy property named AAR on this Gradle runtime;
+    # use the attribute's canonical string value instead.
     groovy = f'''repositories {{ google(); mavenCentral() }}
 def composeAll = configurations.maybeCreate('composeAll')
 composeAll.canBeResolved = true
@@ -78,7 +75,7 @@ composeAll.canBeConsumed = false
 composeAll.attributes {{
     attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))
     attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))
-    attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, org.gradle.api.attributes.LibraryElements.AAR))
+    attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, 'aar'))
 }}
 {root_lines}
 tasks.register('dumpArtifacts') {{ doLast {{
@@ -184,8 +181,7 @@ tasks.register('dumpArtifacts') {{ doLast {{
     }
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
-    # IMPORTANT: the distribution ZIP contains ONLY DEX + manifest.
-    # Intermediate classes/JARs remain under build/ and are never packaged.
+    # Distribution ZIP contains ONLY DEX + manifest; no JAR/class files.
     archive = OUT / "compose-libs.zip"
     if archive.exists(): archive.unlink()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
