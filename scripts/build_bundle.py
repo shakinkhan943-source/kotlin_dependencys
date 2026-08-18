@@ -69,6 +69,8 @@ repositories {{
     mavenCentral()
     maven {{ url "https://maven.pkg.jetbrains.space/public/p/compose/dev" }}
     maven {{ url "https://androidx.dev/storage/compose-mirrors/repository/" }}
+    maven {{ url "https://maven.google.com" }}
+    maven {{ url "https://repo.maven.apache.org/maven2" }}
 }}
 {chr(10).join(dependency_lines)}
 
