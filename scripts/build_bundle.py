@@ -51,7 +51,6 @@ def excluded(coord):
 
 
 def jar_has_classes(path):
-    """Return True only when the extracted/copied JAR actually contains class files."""
     try:
         with zipfile.ZipFile(path) as zf:
             return any(n.endswith(".class") for n in zf.namelist())
@@ -64,8 +63,11 @@ def main():
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
 
-    # Resolve every selected root in ONE configuration. Gradle performs one
-    # global conflict resolution instead of mixing separately resolved graphs.
+    # Resolve the complete graph in ONE Gradle configuration. The important
+    # part is using the Android runtime variant instead of a generic JVM
+    # variant. AndroidX/Compose's variant-aware metadata then selects the
+    # corresponding *-android artifacts (ui-text-android, ui-util-android,
+    # ui-graphics-android, ui-unit-android, ui-geometry-android, etc.).
     roots = [root for feature in FEATURES.values() for root in feature["roots"]]
     root_lines = "\n".join(f"dependencies.add('composeAll', '{root}')" for root in roots)
     resolved_json = WORK / "resolved.json"
@@ -73,9 +75,16 @@ def main():
 def composeAll = configurations.maybeCreate('composeAll')
 composeAll.canBeResolved = true
 composeAll.canBeConsumed = false
-composeAll.attributes {{ attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME)); attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY)) }}
+composeAll.attributes {{
+    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))
+    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))
+    attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, org.gradle.api.attributes.LibraryElements.AAR))
+}}
 {root_lines}
-tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}; file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result)) }} }}
+tasks.register('dumpArtifacts') {{ doLast {{
+    def result = composeAll.resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}
+    file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
+}} }}
 '''
     resolver_gradle = WORK / "resolver.gradle"
     resolver_gradle.write_text(groovy, encoding="utf-8")
@@ -93,11 +102,11 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         d8 = str(candidates[-1])
 
     bundle_root = WORK / "bundle"
-    (bundle_root / "classes").mkdir(parents=True)
-    (bundle_root / "dex").mkdir(parents=True)
+    dex_root = bundle_root / "dex"
+    dex_root.mkdir(parents=True)
+    classes_root = WORK / "classes"
+    classes_root.mkdir(parents=True)
 
-    # Gradle has already selected one version per module. Filter only after
-    # that resolution, then deduplicate identical bytecode.
     selected = {}
     rejected = []
     for entry in resolved:
@@ -126,7 +135,7 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         src = Path(entry["file"])
         group, name, version = entry["module"].split(":", 2)
         aid = f"{group}_{name}".replace(".", "_").replace("-", "_")
-        classes_jar = bundle_root / "classes" / f"{aid}.jar"
+        classes_jar = classes_root / f"{aid}.jar"
         if src.suffix.lower() == ".aar":
             with zipfile.ZipFile(src) as zf:
                 if "classes.jar" not in zf.namelist():
@@ -144,20 +153,12 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         dex_tmp.mkdir(parents=True)
         run(d8, "--min-api", "23", "--lib", android_jar, "--output", dex_tmp, classes_jar)
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
-        # Some resolved Android artifacts are metadata/empty modules. They are
-        # valid Gradle dependencies but have no bytecode to ship in a DEX bundle.
         if not dex_files:
             skipped_no_classes.append(entry["module"])
             continue
-        # Normal Compose/AndroidX artifacts should fit in one DEX. If a future
-        # artifact exceeds the limit, preserve all DEX outputs rather than
-        # silently losing bytecode.
-        if len(dex_files) == 1:
-            shutil.move(dex_files[0], bundle_root / "dex" / f"{aid}.dex")
-        else:
-            for index, dex_file in enumerate(dex_files, 1):
-                suffix = "" if index == 1 else str(index)
-                shutil.move(dex_file, bundle_root / "dex" / f"{aid}{suffix}.dex")
+        for index, dex_file in enumerate(dex_files, 1):
+            suffix = "" if index == 1 else str(index)
+            shutil.move(dex_file, dex_root / f"{aid}{suffix}.dex")
         dex_count += len(dex_files)
         artifacts.append({"id": aid, "coordinate": entry["module"], "packageName": group, "dependencies": []})
 
@@ -182,12 +183,16 @@ tasks.register('dumpArtifacts') {{ doLast {{ def result = composeAll.resolvedCon
         "buildStats": {"globallyResolvedArtifacts": len(resolved), "uniqueArtifacts": len(artifacts), "duplicateArtifactsRemoved": duplicate_count, "dexFiles": dex_count},
     }
     (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    # IMPORTANT: the distribution ZIP contains ONLY DEX + manifest.
+    # Intermediate classes/JARs remain under build/ and are never packaged.
     archive = OUT / "compose-libs.zip"
     if archive.exists(): archive.unlink()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in bundle_root.rglob("*"):
-            if path.is_file(): zf.write(path, path.relative_to(bundle_root))
-    print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
+        for path in dex_root.rglob("*.dex"):
+            zf.write(path, Path("dex") / path.name)
+        zf.writestr("compose-libraries.json", json.dumps(manifest, indent=2) + "\n")
+    print(f"Wrote dex-only {archive} and {OUT / 'compose-libraries.json'}")
 
 
 if __name__ == "__main__": main()
