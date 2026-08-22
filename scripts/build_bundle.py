@@ -66,8 +66,13 @@ def main():
     roots = [root for feature in FEATURES.values() for root in feature["roots"]]
     root_lines = "\n".join(f"dependencies.add('composeAll', '{root}')" for root in roots)
     resolved_json = WORK / "resolved.json"
-    # LibraryElements has no Groovy property named AAR on this Gradle runtime;
-    # use the attribute's canonical string value instead.
+
+    # Do NOT force LibraryElements=AAR. AndroidX publishes Gradle Module
+    # Metadata with variant-aware Android dependencies. Normal runtime
+    # resolution is what selects ui-text-android, ui-util-android,
+    # ui-graphics-android, ui-unit-android, ui-geometry-android, etc.
+    # We filter non-Android/platform artifacts after Gradle has resolved the
+    # complete graph instead of breaking variant matching up front.
     groovy = f'''repositories {{ google(); mavenCentral() }}
 def composeAll = configurations.maybeCreate('composeAll')
 composeAll.canBeResolved = true
@@ -75,7 +80,6 @@ composeAll.canBeConsumed = false
 composeAll.attributes {{
     attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))
     attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))
-    attribute(org.gradle.api.attributes.LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(org.gradle.api.attributes.LibraryElements, 'aar'))
 }}
 {root_lines}
 tasks.register('dumpArtifacts') {{ doLast {{
