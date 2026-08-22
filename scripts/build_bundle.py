@@ -25,7 +25,8 @@ FEATURES = {
     "animation": {"name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.animation:animation-android:{COMPOSE_UI}"]},
     "material-icons": {"name": "Material Icons Extended", "description": "The full Material icon set for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.material:material-icons-extended-android:{COMPOSE_UI}"]},
     "navigation-compose": {"name": "Navigation Compose", "description": "Navigate between composables with a NavHost/NavController.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"]},
-    "lifecycle-compose": {"name": "Lifecycle ViewModel Compose", "description": "ViewModel + lifecycle-aware state collection for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}"]},
+    "lifecycle-compose": {"name": "Lifecycle ViewModel + Runtime Compose", "description": "ViewModel + lifecycle-aware state collection for Compose (viewModel(), collectAsStateWithLifecycle()).", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}", f"androidx.lifecycle:lifecycle-runtime-compose:{LIFECYCLE_COMPOSE}"]},
+    "ui-tooling-preview": {"name": "Compose UI Tooling Preview", "description": "Stubs required by @Preview composables.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.ui:ui-tooling-preview-android:{COMPOSE_UI}"]},
 }
 
 SKIP_COORDINATE_PREFIXES = (
