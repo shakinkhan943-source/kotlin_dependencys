@@ -25,7 +25,7 @@ FEATURES = {
     "animation": {"name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.animation:animation-android:{COMPOSE_UI}"]},
     "material-icons": {"name": "Material Icons Extended", "description": "The full Material icon set for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.material:material-icons-extended-android:{COMPOSE_UI}"]},
     "navigation-compose": {"name": "Navigation Compose", "description": "Navigate between composables with a NavHost/NavController.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"]},
-    "lifecycle-compose": {"name": "Lifecycle ViewModel + Runtime Compose", "description": "ViewModel + lifecycle-aware state collection for Compose (viewModel(), collectAsStateWithLifecycle()).", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}", f"androidx.lifecycle:lifecycle-runtime-compose:{LIFECYCLE_COMPOSE}"]},
+    "lifecycle-compose": {"name": "Lifecycle ViewModel + Runtime Compose", "description": "ViewModel + lifecycle-aware state collection for Compose (viewModel(), collectAsStateWithLifecycle()).", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose-android:{LIFECYCLE_COMPOSE}", f"androidx.lifecycle:lifecycle-runtime-compose-android:{LIFECYCLE_COMPOSE}"]},
     "ui-tooling-preview": {"name": "Compose UI Tooling Preview", "description": "Stubs required by @Preview composables.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.ui:ui-tooling-preview-android:{COMPOSE_UI}"]},
 }
 
@@ -64,34 +64,18 @@ def main():
     WORK.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
 
-    roots = [root for feature in FEATURES.values() for root in feature["roots"]]
-    root_lines = "\n".join(f"dependencies.add('composeAll', '{root}')" for root in roots)
-    resolved_json = WORK / "resolved.json"
-
-    # Do NOT force LibraryElements=AAR. AndroidX publishes Gradle Module
-    # Metadata with variant-aware Android dependencies. Normal runtime
-    # resolution is what selects ui-text-android, ui-util-android,
-    # ui-graphics-android, ui-unit-android, ui-geometry-android, etc.
-    # We filter non-Android/platform artifacts after Gradle has resolved the
-    # complete graph instead of breaking variant matching up front.
-    groovy = f'''repositories {{ google(); mavenCentral() }}
-def composeAll = configurations.maybeCreate('composeAll')
-composeAll.canBeResolved = true
-composeAll.canBeConsumed = false
-composeAll.attributes {{
-    attribute(org.gradle.api.attributes.Usage.USAGE_ATTRIBUTE, objects.named(org.gradle.api.attributes.Usage, org.gradle.api.attributes.Usage.JAVA_RUNTIME))
-    attribute(org.gradle.api.attributes.Category.CATEGORY_ATTRIBUTE, objects.named(org.gradle.api.attributes.Category, org.gradle.api.attributes.Category.LIBRARY))
-}}
-{root_lines}
-tasks.register('dumpArtifacts') {{ doLast {{
-    def result = composeAll.resolvedConfiguration.resolvedArtifacts.collect {{ a -> [file: a.file.absolutePath, module: a.moduleVersion.id.group + ':' + a.name + ':' + a.moduleVersion.id.version] }}
-    file('{resolved_json.as_posix()}').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
-}} }}
-'''
-    resolver_gradle = WORK / "resolver.gradle"
-    resolver_gradle.write_text(groovy, encoding="utf-8")
-    (WORK / "settings.gradle").write_text("rootProject.name = 'compose-bundle-resolver'\n", encoding="utf-8")
-    run("gradle", "-q", "-b", resolver_gradle, "dumpArtifacts")
+    # Resolution now happens in the real `compose-catalog` Android library
+    # module (see compose-catalog/build.gradle.kts) instead of a hand-rolled
+    # Gradle configuration in a generated script. AGP wires up the correct
+    # Kotlin Multiplatform variant attributes automatically -- the same way
+    # any real app's runtimeClasspath does -- so ui-text-android,
+    # ui-graphics-android, lifecycle-runtime-compose-android, etc. all
+    # resolve correctly without manual attribute hacking.
+    resolved_json = ROOT / "compose-catalog" / "build" / "resolved.json"
+    if resolved_json.exists(): resolved_json.unlink()
+    run("gradle", "-q", "-p", ROOT, ":compose-catalog:dumpArtifacts")
+    if not resolved_json.is_file():
+        raise RuntimeError(f"dumpArtifacts did not produce {resolved_json}")
     resolved = json.loads(resolved_json.read_text(encoding="utf-8"))
 
     android_jar_env = os.environ.get("ANDROID_JAR")
@@ -197,3 +181,4 @@ tasks.register('dumpArtifacts') {{ doLast {{
 
 
 if __name__ == "__main__": main()
+
