@@ -1,8 +1,13 @@
 """Build a curated Android-only Jetpack Compose dependency bundle.
 
 Produces:
-  output/compose-libraries.json   - manifest with feature roots + artifact dependency edges
-  output/compose-libs.zip         - pre-dexed runtime + per-artifact compile jars/resources
+  output/compose-libs.zip  - per-artifact folder layout:
+        <id>/classes.jar         - compile-time jar
+        <id>/classes.dex         - pre-dexed runtime bytecode (classes2.dex, ... if multi-dex)
+        <id>/res/...             - extracted AAR resources
+        <id>/assets/...          - extracted AAR assets
+        <id>/proguard.txt        - consumer ProGuard rules, if any
+        <id>/AndroidManifest.xml - AAR manifest (for manifest merger), if any
 """
 import hashlib
 import json
@@ -15,23 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "output"
 WORK = ROOT / "build" / "bundle"
-COMPOSE_UI = os.environ.get("COMPOSE_UI_VERSION", "1.7.8")
-COMPOSE_MATERIAL3 = os.environ.get("COMPOSE_MATERIAL3_VERSION", "1.3.1")
-ACTIVITY_COMPOSE = os.environ.get("ACTIVITY_COMPOSE_VERSION", "1.9.3")
-NAVIGATION_COMPOSE = os.environ.get("NAVIGATION_COMPOSE_VERSION", "2.8.5")
-LIFECYCLE_COMPOSE = os.environ.get("LIFECYCLE_COMPOSE_VERSION", "2.8.7")
 ANDROID_PLATFORM = os.environ.get("ANDROID_COMPILE_SDK", "android-36")
-
-FEATURES = {
-    "core": {"name": "Compose Core", "description": "Required Compose runtime, UI and foundation APIs.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.runtime:runtime-android:{COMPOSE_UI}", f"androidx.compose.ui:ui-android:{COMPOSE_UI}", f"androidx.compose.foundation:foundation-android:{COMPOSE_UI}"]},
-    "material3": {"name": "Material 3", "description": "Material 3 components and theming for Compose.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.material3:material3-android:{COMPOSE_MATERIAL3}"]},
-    "activity-compose": {"name": "Activity Compose", "description": "Integrates Compose content with Android activities.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.activity:activity-compose:{ACTIVITY_COMPOSE}"]},
-    "animation": {"name": "Compose Animation", "description": "Animation APIs beyond the core foundation set.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.animation:animation-android:{COMPOSE_UI}"]},
-    "material-icons": {"name": "Material Icons Extended", "description": "The full Material icon set for Compose.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.compose.material:material-icons-extended-android:{COMPOSE_UI}"]},
-    "navigation-compose": {"name": "Navigation Compose", "description": "Navigate between composables with a NavHost/NavController.", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.navigation:navigation-compose:{NAVIGATION_COMPOSE}"]},
-    "lifecycle-compose": {"name": "Lifecycle ViewModel + Runtime Compose", "description": "ViewModel + lifecycle-aware state collection for Compose (viewModel(), collectAsStateWithLifecycle()).", "required": False, "tag": "OPTIONAL", "roots": [f"androidx.lifecycle:lifecycle-viewmodel-compose:{LIFECYCLE_COMPOSE}", f"androidx.lifecycle:lifecycle-runtime-compose-android:{LIFECYCLE_COMPOSE}"]},
-    "ui-tooling-preview": {"name": "Compose UI Tooling Preview", "description": "Stubs required by @Preview composables.", "required": True, "tag": "IMPORTANT", "roots": [f"androidx.compose.ui:ui-tooling-preview-android:{COMPOSE_UI}"]},
-}
 
 SKIP_COORDINATE_PREFIXES = (
     "org.jetbrains.kotlin:kotlin-stdlib",
@@ -84,11 +73,14 @@ def main():
         if not candidates: raise RuntimeError("d8 executable not found")
         d8 = str(candidates[-1])
 
-    bundle_root = WORK / "bundle"
-    dex_root = bundle_root / "dex"
-    dex_root.mkdir(parents=True)
-    classes_root = WORK / "classes"
-    classes_root.mkdir(parents=True)
+    # Per-artifact staging directory. Each artifact gets its own folder
+    # named by its <id> and containing classes.jar, classes*.dex, and (when
+    # the AAR ships them) res/, assets/, proguard.txt, AndroidManifest.xml.
+    artifacts_root = WORK / "artifacts"
+    artifacts_root.mkdir(parents=True)
+
+    classes_tmp = WORK / "classes-tmp"
+    classes_tmp.mkdir(parents=True)
 
     selected = {}
     rejected = []
@@ -98,7 +90,7 @@ def main():
             rejected.append(module)
             continue
         group, name, version = module.split(":", 2)
-        selected[f"{group}:{name}"] = {"file": file, "module": module, "dependencies": entry.get("dependencies", [])}
+        selected[f"{group}:{name}"] = {"file": file, "module": module}
 
     unique_by_hash = {}
     duplicate_count = 0
@@ -111,44 +103,55 @@ def main():
         unique_by_hash[digest] = key
         final_entries.append(entry)
 
-    selected_aids = set()
-    for entry in final_entries:
-        g, n, _ = entry["module"].split(":", 2)
-        selected_aids.add(f"{g}_{n}".replace(".", "_").replace("-", "_"))
-
-    artifacts = []
-    skipped_no_classes = []
+    artifact_count = 0
     dex_count = 0
-    library_roots = []
+    skipped_no_classes = []
+
     for entry in final_entries:
         src = Path(entry["file"])
         group, name, version = entry["module"].split(":", 2)
         aid = f"{group}_{name}".replace(".", "_").replace("-", "_")
-        classes_jar = classes_root / f"{aid}.jar"
-        lib_dir = WORK / "libs" / aid
-        lib_dir.mkdir(parents=True, exist_ok=True)
+
+        art_dir = artifacts_root / aid
+        art_dir.mkdir(parents=True, exist_ok=False)
+
+        classes_jar = classes_tmp / f"{aid}.jar"
+        if classes_jar.exists(): classes_jar.unlink()
+
+        # Extract classes.jar + res/ + assets/ + consumer rules + manifest from
+        # AARs; plain jars are used as-is. res, assets, the manifest and
+        # consumer ProGuard rules are all required by the IDE and build
+        # pipeline (resource merger, manifest merger, aapt2, R8), so dropping
+        # them causes compile/runtime errors.
         if src.suffix.lower() == ".aar":
             with zipfile.ZipFile(src) as zf:
-                if "classes.jar" not in zf.namelist():
+                names = zf.namelist()
+                if "classes.jar" not in names:
                     skipped_no_classes.append(entry["module"])
+                    shutil.rmtree(art_dir)
                     continue
                 classes_jar.write_bytes(zf.read("classes.jar"))
-                if "proguard.txt" in zf.namelist():
-                    (lib_dir / "proguard.txt").write_bytes(zf.read("proguard.txt"))
-                for member in ("res", "assets"):
-                    for nm in zf.namelist():
-                        if nm.startswith(member + "/") and not nm.endswith("/"):
-                            out = lib_dir / nm
-                            out.parent.mkdir(parents=True, exist_ok=True)
-                            out.write_bytes(zf.read(nm))
+                # Directory trees shipped by the AAR.
+                for nm in names:
+                    if (nm.startswith("res/") or nm.startswith("assets/")) and not nm.endswith("/"):
+                        out = art_dir / nm
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        out.write_bytes(zf.read(nm))
+                # Single files the IDE/build pipeline expects at the library root.
+                for single in ("proguard.txt", "consumer-rules.pro", "AndroidManifest.xml"):
+                    if single in names:
+                        (art_dir / single).write_bytes(zf.read(single))
         else:
             shutil.copy2(src, classes_jar)
+
         if not classes_jar.exists() or classes_jar.stat().st_size == 0 or not jar_has_classes(classes_jar):
             skipped_no_classes.append(entry["module"])
+            shutil.rmtree(art_dir)
             continue
-        shutil.copy2(classes_jar, lib_dir / "classes.jar")
-        library_roots.append((aid, lib_dir))
 
+        shutil.copy2(classes_jar, art_dir / "classes.jar")
+
+        # Dex the jar individually and place classes*.dex next to classes.jar.
         dex_tmp = WORK / "dex-tmp"
         if dex_tmp.exists(): shutil.rmtree(dex_tmp)
         dex_tmp.mkdir(parents=True)
@@ -156,62 +159,30 @@ def main():
         dex_files = sorted(dex_tmp.glob("classes*.dex"))
         if not dex_files:
             skipped_no_classes.append(entry["module"])
+            shutil.rmtree(art_dir)
             continue
-        for index, dex_file in enumerate(dex_files, 1):
-            suffix = "" if index == 1 else str(index)
-            shutil.move(dex_file, dex_root / f"{aid}{suffix}.dex")
+        for dex_file in dex_files:
+            shutil.move(str(dex_file), str(art_dir / dex_file.name))
         dex_count += len(dex_files)
+        artifact_count += 1
 
-        deps = []
-        for dep in entry.get("dependencies", []) or []:
-            if excluded(dep):
-                continue
-            dg, dn = dep.split(":", 2)[:2]
-            did = f"{dg}_{dn}".replace(".", "_").replace("-", "_")
-            if did in selected_aids:
-                deps.append(did)
-        artifacts.append({"id": aid, "coordinate": entry["module"], "packageName": group, "dependencies": deps})
-
-    total_deps = sum(len(a["dependencies"]) for a in artifacts)
-    if total_deps == 0:
-        print("WARNING: no artifact has dependency edges. Sketchware will only select feature roots,")
-        print("so transitive artifacts will be missing from the build. Make sure :compose-catalog:dumpArtifacts")
-        print("emits the resolved graph in each entry's 'dependencies' field.", flush=True)
-
-    feature_meta = []
-    for fid, feature in FEATURES.items():
-        roots_for_feature = []
-        for root in feature["roots"]:
-            parts = root.split(":")
-            root_key = f"{parts[0]}:{parts[1]}"
-            roots_for_feature += [a["id"] for a in artifacts if a["coordinate"].startswith(root_key + ":")]
-        feature_meta.append({"id": fid, "name": feature["name"], "description": feature["description"], "required": feature["required"], "tag": feature["tag"], "roots": sorted(set(roots_for_feature))})
-
-    manifest = {
-        "schemaVersion": 2,
-        "composeVersion": COMPOSE_UI,
-        "material3Version": COMPOSE_MATERIAL3,
-        "features": feature_meta,
-        "artifacts": artifacts,
-        "skippedBuiltInDependencies": list(SKIP_COORDINATE_PREFIXES),
-        "rejectedPlatformArtifacts": sorted(set(rejected)),
-        "skippedNoBytecodeArtifacts": sorted(set(skipped_no_classes)),
-        "buildStats": {"globallyResolvedArtifacts": len(resolved), "uniqueArtifacts": len(artifacts), "duplicateArtifactsRemoved": duplicate_count, "dexFiles": dex_count},
-    }
-    (OUT / "compose-libraries.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
+    # If an artifact has no res/ or assets/, the folder simply contains
+    # classes.jar + classes*.dex (+ optional consumer rules / manifest for
+    # AARs that ship them).
     archive = OUT / "compose-libs.zip"
     if archive.exists(): archive.unlink()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in dex_root.rglob("*.dex"):
-            zf.write(path, Path("dex") / path.name)
-        for aid, lib_dir in library_roots:
-            for path in lib_dir.rglob("*"):
+        for art_dir in sorted(artifacts_root.iterdir()):
+            if not art_dir.is_dir():
+                continue
+            for path in art_dir.rglob("*"):
                 if path.is_file():
-                    zf.write(path, Path("libraries") / aid / path.relative_to(lib_dir))
-        zf.writestr("compose-libraries.json", json.dumps(manifest, indent=2) + "\n")
-    print(f"Wrote {archive} and {OUT / 'compose-libraries.json'}")
-    print(f"Artifacts: {len(artifacts)}, DEX files: {dex_count}, Library dirs: {len(library_roots)}")
+                    zf.write(path, path.relative_to(artifacts_root))
+
+    print(f"Wrote {archive}")
+    print(f"Artifacts: {artifact_count}, DEX files: {dex_count}, Duplicates removed: {duplicate_count}")
+    if skipped_no_classes:
+        print(f"Skipped (no bytecode): {len(skipped_no_classes)}")
 
 
 if __name__ == "__main__": main()
