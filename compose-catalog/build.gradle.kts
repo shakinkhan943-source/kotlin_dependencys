@@ -7,7 +7,7 @@ android {
     compileSdk = (System.getenv("ANDROID_COMPILE_SDK_LEVEL") ?: "36").toInt()
 
     defaultConfig {
-        minSdk = 24
+        minSdk = 26
     }
 
     compileOptions {
