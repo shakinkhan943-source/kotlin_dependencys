@@ -32,8 +32,7 @@ on:
 permissions:
   contents: write
 
-  env:
-  
+env:
   COMPOSE_BOM_VERSION: ${{ github.event.inputs.compose_bom_version || '2026.06.01' }}
   KOTLIN_VERSION: ${{ github.event.inputs.kotlin_version || '2.4.10' }}
   COROUTINES_VERSION: ${{ github.event.inputs.coroutines_version || '1.11.0' }}
@@ -78,7 +77,6 @@ jobs:
       - name: Build bundle
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
-          
         run: python3 scripts/build_bundle.py
 
       # Downloadable from the run's "Artifacts" section, kept for 90 days.
