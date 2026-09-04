@@ -13,5 +13,5 @@
 // needs a different pin.
 plugins {
   id("com.android.library") version (System.getenv("AGP_VERSION") ?: "9.1.1") apply false
-  id("org.jetbrains.kotlin.android") version (System.getenv("KOTLIN_VERSION") ?: "2.2.10") apply false
+  id("org.jetbrains.kotlin.android") version (System.getenv("KOTLIN_VERSION") ?: "2.4.10") apply false
 }
